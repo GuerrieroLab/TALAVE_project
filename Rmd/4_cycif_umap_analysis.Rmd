@@ -1,0 +1,654 @@
+---
+title: "TALAVE CyCIF analysis: UMAP Analysis (All Cells, Tumor, Macrophages)"
+author: "Kenichi Shimada"
+---
+
+# TALAVE CyCIF analysis
+
+Runs UMAP-based cell-state analysis (All Cells, Tumor Cells, Macrophages), producing the
+macrophage clustering (`cluster_mac`) that `5` merges with its own TME clustering for `6`.
+
+**Required run order: `3` -> `4` (this notebook) -> `5` -> `6`.**
+No dependency on `3` or `5` -- only needs the base `cs7`/`frnn7.cmb` checkpoint.
+
+`cs7.rds` and `cycif_spatial_frnn_input_data.rda` (frnn7.cmb, frnn7.exp, frnn7.rcn,
+is.sele.7) are two separate checkpoint files, also loaded directly by `3` and `6`. This
+notebook doesn't use `cs5` at all, so `cs5.rds` is never loaded here. `pd7`/`cts7`/`ct.cols7`
+are one-line derivations from `cs7`, defined locally below rather than saved in the
+checkpoint.
+
+## ---- Initial Setup ----
+
+### Load Configuration
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+if (!requireNamespace("CycifAnalyzeR", quietly = TRUE)) {
+  remotes::install_github("<org>/CycifAnalyzeR")
+}
+library(CycifAnalyzeR)
+source(file.path(root_dir, "functions", "plotting.R"))
+source(file.path(source_dir, "analysis_cycif.R"))
+source(file.path(source_dir, "io.R"))
+source(file.path(source_dir, "plotting_cycif.R"))
+source(file.path(source_dir, "qc_cycif.R"))
+
+brca.fills = c(MUT="#C9C0DD", WT="#D9DADA")
+brca.cols = c(MUT="#62439c",WT="#58575f")
+brca.mids = c(MUT="#62439c",WT="grey50")
+```
+
+## ---- Load Inputs ----
+
+```{r}
+cs7 <- readRDS(file.path(cycif_obj_dir, "cs7.rds"))
+load(file.path(cycif_obj_dir, "cycif_spatial_frnn_input_data.rda")) # frnn7.cmb, frnn7.exp, frnn7.rcn, is.sele.7
+
+pd7 <- pData(cs7)
+cts7 <- cell_types(cs7)
+ct.cols7 <- get_cycif_ct_colors()
+pt.cols <- load_pt_colors()
+```
+
+## ---- UMAP Analysis ----
+### Load CN Data
+```{r}
+x <- load(file=file.path(cycif_obj_dir,"cycif7_neighborhood_profiles.rda")) # frnn7.rcn,frnn7.exp
+frnn7.rcn.n <- rowSums(frnn7.rcn)
+is.ge10.7 <- frnn7.rcn.n >= 10
+```
+
+```{r}
+exp.1 <- exprs(cs7, type="log") %>% cbind(cts7) %>% filter(cell_types != "outOfROI") 
+exp.2 <- exprs(cs7, type="logTh") %>%  mutate(across(everything(), ~ . > 0.5)) %>% cbind(cts7) %>% filter(cts7$cell_types != "outOfROI")
+
+m.exp.1 <- exp.1 %>% filter(is.sele.7)
+m.exp.2 <- exp.2 %>% filter(is.sele.7)
+
+cst <- cs7@cell_types$default@cell_state_def
+```
+
+### Define UMAP Plotting Helpers
+`plotting_cycif.R` defines the UMAP plotting helpers used below.
+
+### 1. All Cells
+```{r}
+used.abs <- names(exp.1)[4:21]
+
+umap <- build_umap_embedding(m.exp.1, features = used.abs, n_neighbors = 20, seed = 123)
+
+dt.all <- bind_umap_to_tables(
+  df_list = list(m.exp.1, m.exp.2),
+  umap = umap,
+  pd = pd7
+)
+dt.all.1 <- dt.all[[1]]
+
+```
+#### [EDF4A, EDF4B] All-Cell UMAP Outputs
+
+```{r}
+if(!dir.exists(file.path(cycif_fig_dir, "umap", "all", "metadata"))){
+  dir.create(file.path(cycif_fig_dir, "umap", "all", "metadata"),recursive=T)
+  dir.create(file.path(cycif_fig_dir, "umap", "all", "ab"),recursive=T)
+}
+p1_full <- umap_base(dt.all.1, aes(x = umap_x, y = umap_y, col = cell_types)) +
+  scale_color_manual(values = ct.cols7) +
+  ggtitle("Cell types")
+p1 <- p1_full + theme(legend.position = "none")
+save_legend_pdf(p1_full, file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_cts_legend.pdf"), width = 4, height = 6)  
+ggsave(file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_cts.png"), p1, width = 9, height = 10, units ="in", dpi = 300)
+
+p2_full <- umap_base(dt.all.1, aes(x = umap_x, y = umap_y, col = sample)) +
+  ggtitle("Samples")
+p2 <- p2_full + theme(legend.position = "none")
+save_legend_pdf(p2_full, file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_smpls_legend.pdf"), width = 4, height = 8)  
+ggsave(file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_sample.png"), p2, width = 9, height = 10, units ="in", dpi = 300)
+
+p3_full <- umap_base(dt.all.1, aes(x = umap_x, y = umap_y, col = TimePoint)) +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("TimePoint, stratified by BRCA")
+p3 <- p3_full + theme(legend.position = "none")
+p3 <- p3 + facet_wrap(~BRCA) + theme(strip.text = element_text(size = 36))
+save_legend_pdf(p3_full, file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_bt3_wide_legend.pdf"), width = 4, height = 6)  
+ggsave(file.path(cycif_fig_dir, "umap", "all", "metadata", "umap_bt3_wide.png"), p3, width = 14, height = 7, units = "in", dpi = 300)
+
+
+```
+##### Protein Expression: Numerical
+```{r}
+for(ab1 in used.abs){
+  dtt <- dt.all.1 %>% 
+    select(umap_x,umap_y,!!sym(ab1)) %>%
+    rename(ab=ab1)
+  abx <- dtt$ab
+  th <- quantile(abx,c(.05,.95))
+  abx[abx < th[1]] <- th[1]
+  abx[abx > th[2]] <- th[2]
+  
+  dtt$ab <- abx
+
+  p <- ggplot(dtt,aes(x=umap_x,y=umap_y,col=ab)) + 
+    geom_point(size=.1) +
+    coord_fixed(ratio=1) +
+    viridis::scale_color_viridis(guide = "none") +
+    theme_minimal() +
+    ggtitle(ab1) + 
+    umap_styling_1(
+      title_size = 80,
+      legend_title_margin = FALSE,
+      legend_key_height = 1.5
+    )
+
+  if (ab1 == used.abs[1]) {
+    p_full <- ggplot(dtt, aes(x = umap_x, y = umap_y, col = ab)) + 
+      geom_point(size = 0.1) +
+      coord_fixed(ratio = 1) +
+      viridis::scale_color_viridis(name = ab1) +
+      theme_minimal() +
+      ggtitle(ab1) + 
+      umap_styling_1(
+        title_size = 80,
+        legend_title_margin = FALSE,
+        legend_key_height = 1.5
+      )
+
+    save_legend_pdf(p_full,
+      file.path(cycif_fig_dir, "umap", "all", "ab", paste0("legend__", ab1, ".pdf")),
+      width = 4, height = 6
+    )
+  }    
+  
+  png(file.path(cycif_fig_dir, "umap", "all", "ab", paste0("umap__",ab1,".png")),
+      width=1000,height=1000)
+  print(p)
+  dev.off()
+}
+```
+
+### 2. Tumor Cells
+```{r}
+this.cts <- c("Tumor_panCK","Tumor_neg")
+rs <- rowSums(table(cts7)[,this.cts])
+rs.all <- rowSums(table(cts7))
+
+n.cells <- cbind(rs=rs,all=rs.all) # identical
+
+n.used <- quantile(n.cells[,"rs"],.2)
+
+set.seed(12345)
+lst.sele.tum <- sapply(rs,function(x){
+  n1 <- min(x,n.used)
+  sele <- sample(x,n1)
+  is.sele <- seq(x) %in% sele
+  return(is.sele)
+})
+is.sele.tum <- unlist(lst.sele.tum)
+```
+
+
+```{r}
+used.abs1 <- c("panCK",names(cst)[apply(cst[this.cts,]=="CAN",2,function(x)any(!is.na(x) & x))])
+tum.exp.1 <- exp.1 %>%
+  filter(cell_types %in% this.cts) %>%
+  filter(is.sele.tum)
+tum.exp.2 <- exp.2 %>%
+  filter(cell_types %in% this.cts) %>%
+  filter(is.sele.tum)
+
+umap2 <- build_umap_embedding(tum.exp.1, features = used.abs1, n_neighbors = 20, seed = 123)
+
+dt.tum <- bind_umap_to_tables(
+  df_list = list(tum.exp.1, tum.exp.2),
+  umap = umap2,
+  pd = pd7,
+  include_bor = TRUE
+)
+dt.tum.1 <- dt.tum[[1]]
+dt.tum.2 <- dt.tum[[2]]
+```
+#### [EDF2H, Fig 3F, EDF3E, EDF3F] Tumor UMAP Outputs
+##### Volcano Plot Between Tumor_panCK and Tumor_neg
+
+Per-marker `lmer(marker ~ cell_types + (1 | sample))` comparing Tumor_neg vs Tumor_panCK.
+P-values are deliberately left uncorrected (nominal p only): small marker family,
+single-cell-level panel with only 2 samples.
+```{r}
+dt.tum.1.1 <- dt.tum.1 %>%
+  filter(sample %in% c("3005-3","1014-3")) %>%
+  filter(cell_types %in% this.cts) %>%
+  select(sample,cell_types,!!!syms(used.abs1[-1]))
+
+markers <- setdiff(names(dt.tum.1.1), c("sample", "cell_types"))
+
+dt_sub <- dt.tum.1.1 %>%
+  filter(cell_types %in% c("Tumor_panCK", "Tumor_neg"))
+
+results <- lapply(markers, function(m) {
+  formula <- as.formula(paste0(m, " ~ cell_types + (1 | sample)"))
+  fit <- lmer(formula, data = dt_sub)
+  coef_df <- tidy(fit, effects = "fixed") %>%
+    filter(term == "cell_typesTumor_neg") %>%
+    mutate(marker = m)
+  return(coef_df)
+})
+
+res_df <- bind_rows(results) %>%
+  select(marker, estimate, std.error, statistic, p.value)
+
+p <- ggplot(res_df, aes(x = estimate, y = -log10(p.value), label = marker)) +
+  geom_point(aes(color = p.value < 0.05), size = 3) +
+  geom_text_repel(size=5) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey20") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey20") +  
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",color = "grey50") +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "Mean Difference (Tumor_neg - Tumor_pos)",
+       y = "-log10(p-value)",
+       title = "Volcano Plot (p < 0.05)",
+       color = "p < 0.05") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+pdf(file.path(cycif_fig_dir, "umap", "tumor", "volcano_plot_tumor_panCK_vs_neg_ori.pdf"),width=5,height=7)
+print(p)
+dev.off()
+```
+##### Density-Based Co-Expression
+```{r}
+coex_res <- prepare_density_coexpression_df(
+  dt.tum.1 %>% select(!!!syms(c(used.abs1)))
+)
+expr_mat <- coex_res$expr_mat
+coex_tum <- coex_res$coex_mat
+rho <- coex_res$rho
+r <- coex_res$r
+
+p <- ggplot(expr_mat, aes(x = gH2AX, y = pTBK1, color = density)) +
+  geom_point(size = 1.5) +
+  scale_color_identity() +
+  annotate(
+    "text",
+    x = Inf, y = -Inf,
+    label = paste0(
+      "Pearson r = ", round(r, 2),"\n",
+      "Spearman \u03C1 = ", round(rho, 2)
+    ),
+    hjust = 1.1, vjust = -0.7,
+    size = 10
+  ) +
+  theme_minimal() +
+  labs(
+    title = "γH2AX vs pTBK1 expression (Tumor cells)",
+    x = expression(gamma*"H2AX expression (log)"),
+    y = "pTBK1 expression (log)"
+  ) +
+  theme(
+    plot.title = element_text(size = 30, hjust = 0.5, color = "black"),
+    axis.text = element_text(size = 20, color = "black"),
+    axis.title = element_text(size = 24, color = "black"),
+    axis.key.size = unit(1.2, "cm")
+  )
+
+ggsave(file.path(cycif_fig_dir, "umap", "tumor", "gh2ax_ptbk1_tum_v2.png"),
+       p, width = 9, height = 10,  units ="in", dpi = 300)
+```
+
+```{r}
+mean_bt3 <- prepare_sample_marker_means_df(
+  df = dt.tum.1,
+  markers = c("gH2AX", "pTBK1")
+)
+fit_bt3 <- lm(pTBK1_mean ~ gH2AX_mean, data = mean_bt3)
+summary(fit_bt3)
+
+cor_bt3 <- cor.test(
+  mean_bt3$gH2AX_mean,
+  mean_bt3$pTBK1_mean,
+  method = "spearman"
+)
+
+rho_bt3  <- cor_bt3$estimate
+p_bt3    <- cor_bt3$p.value
+
+cor_bt3_pearson <- cor.test(
+  mean_bt3$gH2AX_mean,
+  mean_bt3$pTBK1_mean,
+  method = "pearson"
+)
+
+r_bt3  <- cor_bt3_pearson$estimate
+p_bt3    <- cor_bt3_pearson$p.value
+
+p <- ggplot(mean_bt3, aes(x = gH2AX_mean, y = pTBK1_mean)) +
+
+  # bt3 mean points
+  geom_point(aes(color = bt3), size = 4) +
+
+  # regression line across bt3 means
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    linewidth = 1.5
+  ) +
+
+  theme_minimal() +
+  labs(
+    title = "γH2AX vs pTBK1 expression (Tumor cells)",
+    x = expression(gamma*"H2AX expression (log)"),
+    y = "pTBK1 expression (log)"
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = -Inf,
+      label = paste0("Pearson r = ", round(r_bt3, 2),
+                   "\nSpearman \u03C1  = ", round(rho_bt3,2)),
+    size = 9,
+    hjust = 1,vjust=-0.8
+  ) +
+  theme(
+    plot.title = element_text(size = 30, hjust = 0.5, color = "black"),
+    axis.text = element_text(size = 20, color = "black"),
+    axis.title = element_text(size = 24, color = "black")
+  )
+
+ggsave(file.path(cycif_fig_dir, "umap", "tumor", "gh2ax_ptbk1_bt3_means_pts.pdf"), 
+       p, width = 10, height = 10,  units ="in", dpi = 300, device = cairo_pdf)
+```
+
+##### Mean Expression Summary
+```{r}
+p.gh2ax <- plot_ct(mean_bt3,y_var="gH2AX_mean",y_label="gH2AX (mean per sample)",title="gH2AX in tumor cells (CyCIF)",pt.cols=pt.cols)
+
+pdf(file.path(cycif_fig_dir, "umap", "tumor", "gH2AX_mean.pdf"),width=5,height=7)
+print(p.gh2ax$plot)
+dev.off()
+
+p.ptbk1 <- plot_ct(mean_bt3,y_var="pTBK1_mean",y_label="pTBK1 (mean per sample)",title="pTBK1 in tumor cells (CyCIF)",pt.cols=pt.cols)
+pdf(file.path(cycif_fig_dir, "umap", "tumor", "pTBK1_mean.pdf"),width=5,height=7)
+print(p.ptbk1$plot)
+dev.off()
+```
+
+### 3. Macrophages
+```{r}
+this.cts2 <- c("Mac_CD68","Mac_CD68_CD163","Mac_CD163")
+rs <- rowSums(table(cts7)[,this.cts2])
+n.cells <- cbind(rs=rs,all=rs.all) # identical
+
+n.used <- round(quantile(n.cells[,"rs"],.2))
+
+set.seed(12345)
+lst.sele.mac <- sapply(rs,function(x){
+  n1 <- min(x,n.used)
+  sele <- sample(x,n1)
+  is.sele <- seq(x) %in% sele
+  return(is.sele)
+})
+is.sele.mac <- unlist(lst.sele.mac)
+```
+
+```{r}
+cell_types <- cts7[, "cell_types"]
+idx.split <- split(seq_along(cell_types), cell_types)
+this.cts2 <- c("Mac_CD68", "Mac_CD68_CD163", "Mac_CD163")
+idx.mac.all <- unlist(idx.split[this.cts2])
+is.sele.full <- rep(FALSE, length(cell_types))
+is.sele.full[idx.mac.all] <- is.sele.mac
+is.sele.full <- is.sele.full[!is.na(cell_types)]
+```
+
+#### Manual Subclassification by PDL1 and cCaspase3
+
+Tumor cells and macrophages were manually classified into PDL1-/PDL1+CC3-/PDL1+CC3+ by
+interactively clicking boundary points on a PDL1-vs-cCaspase3 scatter plot (`plot_scatter_locator_base()`/
+`split_by_clicks()` in `functions/plotting_cycif.R`, applied to `frnn7.cmb.mac`/`frnn7.cmb.tum`); the
+resulting decision boundary (a PDL1 threshold plus a cCaspase3-vs-PDL1 curve) is saved at
+`figures/cycif/exp_2/umap_mac/pdl1_cc3_boundary_coords.rds` and reused (not re-clicked) wherever this
+classification is applied downstream (see `6_cycif_spatial_continued.Rmd`).
+
+#### Prepare Macrophage UMAP Data
+```{r}
+used.abs2 <- c("CD68","CD163",names(cst)[apply(cst[this.cts2,]=="CAN",2,function(x)any(!is.na(x) & x))])
+mac.exp.1 <- exp.1 %>%
+  filter(cell_types %in% this.cts2) %>%
+  filter(is.sele.mac)
+mac.exp.2 <- exp.2 %>%
+  filter(cell_types %in% this.cts2) %>%
+  filter(is.sele.mac)
+
+umap3 <- build_umap_embedding(mac.exp.1, features = used.abs2, n_neighbors = 20, seed = 123)
+
+dt.mac <- bind_umap_to_tables(
+  df_list = list(mac.exp.1, mac.exp.2),
+  umap = umap3,
+  pd = pd7,
+  include_bor = TRUE
+)
+dt.mac.1 <- dt.mac[[1]]
+dt.mac.2 <- dt.mac[[2]]
+
+```
+
+#### [Fig 5C, 5E, 5F, 5G, EDF8F, EDF8H] Macrophage UMAP Outputs
+```{r}
+if(!dir.exists(file.path(cycif_fig_dir, "umap", "mac", "metadata"))){
+  dir.create(file.path(cycif_fig_dir, "umap", "mac", "metadata"),recursive=T)
+  dir.create(file.path(cycif_fig_dir, "umap", "mac", "ab"),recursive=T)
+  dir.create(file.path(cycif_fig_dir, "umap", "mac", "cluster_freq"),recursive=T)
+}
+
+p1_full <- umap_base(dt.mac.1, aes(x = umap_x, y = umap_y, col = cell_types), point_size = 0.8) +
+  scale_color_brewer(palette="Set1") +
+  ggtitle("Cell types")
+p1 <- p1_full + theme(legend.position = "none")
+save_legend_pdf(p1_full, file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_cts_legend.pdf"), width = 4, height = 6)  
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_cts.png"), p1, width = 7, height = 7, units ="in", dpi = 300)
+
+p2_full <- umap_base(dt.mac.1, aes(x = umap_x, y = umap_y, col = sample), point_size = 0.8) +
+  ggtitle("Samples")
+p2 <- p2_full + theme(legend.position = "none")
+save_legend_pdf(p2_full, file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_smpls_legend.pdf"), width = 4, height = 8)  
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_sample.png"), p2, width = 7, height = 7, units ="in", dpi = 300)
+
+p3_full <- umap_base(dt.mac.1, aes(x = umap_x, y = umap_y, col = TimePoint), point_size = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("TimePoint, stratified by BRCA")
+p3 <- p3_full + theme(legend.position = "none")
+p3 <- p3 + facet_wrap(~BRCA) + theme(strip.text = element_text(size = 36))
+save_legend_pdf(p3_full, file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_bt3_wide_legend.pdf"), width = 4, height = 6)  
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_bt3_wide.png"), p3, width = 14, height = 7, units = "in", dpi = 300)
+
+```
+##### Protein Expression: Numerical
+```{r}
+for(ab1 in c(used.abs2,"gH2AX")){
+  dtt <- dt.mac.1 %>% 
+    select(umap_x,umap_y,!!sym(ab1)) %>%
+    rename(ab=ab1)
+  abx <- dtt$ab
+  
+  dtt$ab <- abx
+  coords <- dtt %>% select(umap_x, umap_y) %>% as.matrix()
+  k <- 20
+  knn <- get.knnx(coords, coords, k = k)
+
+  local_abx <- sapply(1:nrow(knn$nn.index), function(i) {
+    mean(abx[knn$nn.index[i, ]])
+  })
+
+  th <- quantile(local_abx,c(.05,.95))
+  local_abx[local_abx < th[1]] <- th[1]
+  local_abx[local_abx > th[2]] <- th[2]
+  
+  dtt$local_abx <- local_abx
+  
+  p <- ggplot(dtt,aes(x=umap_x,y=umap_y,col=local_abx)) + 
+    geom_point(size=0.8) +
+    coord_fixed(ratio=1) +
+    viridis::scale_color_viridis(guide = "none") +
+    theme_minimal() +
+    ggtitle(ab1) + 
+    umap_styling_1()
+
+  if (ab1 == used.abs2[1]) {
+    p_full <- ggplot(dtt, aes(x = umap_x, y = umap_y, col = ab)) +
+      geom_point(size = 0.1) +
+      coord_fixed(ratio = 1) +
+      viridis::scale_color_viridis(name = ab1) +
+      theme_minimal() +
+      ggtitle(ab1) +
+      umap_styling_1()
+
+    save_legend_pdf(p_full,
+      file.path(cycif_fig_dir, "umap", "mac", "ab", paste0("legend__", ab1, ".pdf")),
+      width = 4, height = 6
+    )
+  }
+
+  ggsave(file.path(cycif_fig_dir, "umap", "mac", "ab", paste0("umap__",ab1,"_v2.png")),p, width = 7, height = 7, units = "in", dpi = 300)  
+}
+```
+```{r}
+make_viridis_legend(
+  limits = c(0,5),
+  file = file.path(
+    cycif_fig_dir,
+    "umap",
+    "mac",
+    "ab",
+    "umap_cts_legend_mac_viridis.pdf"
+  )
+)
+```
+
+##### Leiden Clustering
+
+Clusters macrophages by marker expression: k-NN graph (k=20) on the scaled marker matrix,
+then Leiden community detection on that graph.
+```{r}
+mat3 <- exp.1 %>%
+  filter(cell_types %in% this.cts2) %>%
+  filter(is.sele.mac) %>%
+  select(all_of(used.abs2)) %>%
+  as.matrix()
+
+k <- 20
+mat3_scaled <- scale(mat3)
+knn <- get.knn(mat3_scaled,k = k)
+
+edges <- do.call(rbind, lapply(1:nrow(knn$nn.index), function(i) {
+  cbind(i, knn$nn.index[i, ])
+}))
+
+g <- graph_from_edgelist(edges, directed = FALSE)
+g <- igraph::simplify(g)
+
+set.seed(12345)
+leiden_res <- leiden_find_partition(g, resolution_parameter = 5e-4,seed=12345)
+cluster_labels <- membership(leiden_res)
+length(table(cluster_labels))
+```
+
+`frnn7.cmb$cluster_mac` is saved below for `5` to merge with its own TME clustering.
+```{r}
+frnn7.cmb$cluster_mac <- NA
+frnn7.cmb$cluster_mac[is.sele.full] <- paste0("Mac_",cluster_labels)
+```
+
+```{r}
+dt.mac.1 <- dt.mac.1 %>%
+  mutate(cluster = factor(cluster_labels, levels = sort(unique(cluster_labels)))) %>%
+  mutate(cluster = factor(paste0("Mac_", cluster),levels= paste0("Mac_", sort(unique(cluster_labels))))) 
+dt.mac.2 <- dt.mac.2 %>%
+  mutate(cluster = factor(cluster_labels, levels = sort(unique(cluster_labels)))) %>%
+  mutate(cluster = factor(paste0("Mac_", cluster),levels= paste0("Mac_", sort(unique(cluster_labels)))))
+
+label_df <- dt.mac.2 %>%
+  group_by(cluster) %>%
+  summarize(
+    x = median(umap_x, na.rm = TRUE),
+    y = median(umap_y, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>%
+  mutate(cluster = as.numeric(sub("Mac_","",cluster)))
+
+p7 <- umap_base(dt.mac.1, aes(x = umap_x, y = umap_y, col = cluster)) +
+  geom_text(data = label_df, aes(x = x, y = y, label = cluster),
+            color = "black", size = 10) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  ggtitle("Mac clusters") + 
+  theme(legend.position = "none")
+  
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "metadata", "umap_cts_cluster_10.png"),
+       p7, width = 7, height = 7, units = "in", dpi = 300)  
+```
+
+##### Sample-Level Frequencies
+```{r}
+
+sample_cluster_freq <- dt.mac.1 %>%
+  count(sample, cluster) %>%
+  complete(sample, cluster, fill = list(n = 0)) %>%
+  group_by(sample) %>%
+  mutate(rel_freq = n / sum(n)) %>%
+  ungroup() %>%
+  left_join(pd7 %>% select(id, Patient.ID, BRCA, TimePoint, BOR, bt3), by = c("sample" = "id"))
+
+uniq.clusts <- levels(dt.mac.1$cluster)
+d <- file.path(cycif_fig_dir, "umap", "mac", "cluster_freq")
+if(!dir.exists(d)){
+  dir.create(d,recursive=T)
+}
+
+for(cl in uniq.clusts){
+  dfx <- sample_cluster_freq %>% filter(cluster == cl) %>% filter(!is.na(bt3))
+  p <- plot_ct(dfx, y_var = "rel_freq", y_label = paste0("Frequency of ",cl," per sample"),
+          title = paste0(cl, " frequency"),
+          pt.cols = pt.cols)$plot
+  pdf(file.path(d,paste0("sample_freq_",cl,".pdf")),width=5,height=7)
+  print(p)
+  dev.off()
+}
+```
+
+
+### 4. Save UMAP Objects and Coordinates
+
+T-cell UMAP (`dt.t.1`/`dt.cd4.1`/`dt.cd8.1`/`dt.t_other.1`) discarded entirely -- no longer
+used in the manuscript. Only Tumor and Macrophage cell-type-specific UMAPs are needed.
+```{r}
+is.non.na <- !is.na(cts7$cell_types)
+
+dim(dt.tum.1)
+dim(dt.mac.1)
+
+sum(is.sele.tum)
+sum(is.sele.mac)
+
+length(is.sele.tum)
+length(is.sele.mac)
+
+sum(table(exp.1$cell_types)[1:2]) # tumor
+sum(table(exp.1$cell_types)[7:9]) # Mac cells
+
+save(dt.tum.1,dt.mac.1,
+     is.sele.tum,is.sele.mac,
+     is.non.na,
+     file=file.path(cycif_obj_dir,"cycif7_umap_tumor_and_macrophage.rda"))
+```
+
+## ---- Export frnn7.cmb for Notebook 5 ----
+
+`5_cycif_spatial_frnn_tme.Rmd` loads this file and merges `cluster_mac` onto its own
+`cluster_tme`-populated `frnn7.cmb`, producing the combined checkpoint `6` needs.
+```{r}
+saveRDS(frnn7.cmb, file.path(cycif_obj_dir, "cycif7_macrophage_clusters.rds"))
+```

@@ -1,0 +1,1488 @@
+---
+title: "pipeline_talave_v1"
+author: "Kenichi Shimada"
+date: '2022-08-17'
+---
+
+# TALAVE CyCIF analysis
+
+Uses the batch-corrected CyCIF objects to quantify cell-type frequencies, tumor frequencies,
+marker-positive populations, double-positive states, T-cell stratifications, and tumor/stroma
+classification.
+
+**Required run order: `3` (this notebook) -> `4` -> `5` -> `6`.**
+No dependency on the other CyCIF notebooks -- only needs the base `cs5`/`cs7` checkpoint.
+
+
+## ---- Initial Setup ----
+
+### Load Configuration
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+if (!requireNamespace("CycifAnalyzeR", quietly = TRUE)) {
+  remotes::install_github("<org>/CycifAnalyzeR")
+}
+library(CycifAnalyzeR)
+source(file.path(root_dir,"functions","plotting.R"))
+source(file.path(source_dir, "analysis_cycif.R"))
+source(file.path(source_dir, "stats_utils.R"))
+source(file.path(source_dir, "io.R"))
+source(file.path(source_dir, "plotting_cycif.R"))
+source(file.path(source_dir, "qc_cycif.R"))
+
+brca.fills = c(MUT="#C9C0DD", WT="#D9DADA")
+brca.cols = c(MUT="#62439c",WT="#58575f")
+brca.mids = c(MUT="#62439c",WT="grey50")
+
+```
+
+### Load Batch-Corrected Objects
+
+Only `cs5`/`cs7` are needed in this notebook (`frnn7.cmb`/`frnn7.exp`/`frnn7.rcn`/`is.sele.7`
+aren't used here).
+```{r}
+cs5 <- readRDS(file.path(cycif_obj_dir, "cs5.rds"))
+cs7 <- readRDS(file.path(cycif_obj_dir, "cs7.rds"))
+
+pd5 <- pData(cs5)
+pd7 <- pData(cs7)
+cts5 <- cell_types(cs5)
+cts7 <- cell_types(cs7)
+nms7 <- names(cs7)
+uniq.cts <- get_cycif_uniq_cts()
+ct.cols7 <- get_cycif_ct_colors()
+pt.cols <- load_pt_colors()
+```
+
+
+## ---- Define Shared Inputs ----
+```{r}
+cts.all <- c("Immune", "Tumor_panCK", "Fibro", "T", "Mac",
+                "Tumor_neg", "CD8T", "CD4T", "T_other", "Mac_CD68",
+                "Mac_CD163", "Mac_CD68_CD163", "Tumor_all")
+cts.in.5 <- c("Tumor_panCK", "Tumor_neg", "CD8T","Mac_CD68", "Mac_CD163", "Mac_CD68_CD163",
+              "Immune_other", "all_other")
+cts.in.7 <- c("Tumor_panCK", "Tumor_neg", "Fibro", "CD8T", "CD4T", "T_other",
+              "Mac_CD68", "Mac_CD163", "Mac_CD68_CD163", "Immune_other", "all_other")
+cts.in.7only <- c("Fibro", "CD4T", "T_other")
+
+cts.non.leaves <- c("Tumor_all","T","Mac","Immune")
+
+center.cts <- uniq.cts[1:9]
+
+nms5 <- names(cs5)
+nms7only <- nms7[!nms7 %in% nms5]
+```
+
+```{r}
+abs.5 <- c("AF488", "AF555", "AF647", "cCaspase3", "CD3", "PD1",
+    "pERK", "panCK", "PDL1", "CD8a", "CD45", "GrB", "CD68", "CD163",
+    "pAKT")
+abs.7 <- c("AF488", "AF555", "AF647", "cCaspase3", "CD3", "PD1",
+    "pERK", "panCK", "PDL1", "CD8a", "CD45", "GrB", "CD68", "CD163",
+    "pAKT", "CD4", "MCL1", "BCLXL", "pTBK1", "aSMA", "gH2AX")
+abs.7only <- abs.7[!abs.7 %in% abs.5]
+
+all.equal(as.character(pd5$id),names(cs5))
+all.equal(as.character(pd7$id),names(cs7))
+```
+
+## ---- Cell-Type Frequency Analysis ----
+
+### Compute Cell-Type Frequencies
+```{r}
+nfreq5 <- cellTypeFrequency(cs5,simple=TRUE)
+```
+
+
+
+```{r}
+nfreq7 <- cellTypeFrequency(cs7,simple=TRUE)
+```
+
+### [EDF2D] Merged Heatmap and Keys
+```{r}
+nfreq57 <- nfreq5
+identical(rownames(nfreq5),rownames(nfreq7))
+nfreq57[,nms7] <- nfreq7[,nms7]
+
+this.ids <- pd5 %>% pull(id) %>% as.character()
+
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency", "cell_freq_merged_v3.pdf"),width=12,height=7)
+par(mar=c(7,4,4,10))
+xx <- barplot(nfreq57[11:1,this.ids],beside=F,col=ct.cols7[11:1],main="cell type frequency",names.arg=as.character(pd5$id),las=2,cex.names=1)
+legend(par()$usr[2],par()$usr[4],names(ct.cols7[1:11]),fill=ct.cols7[1:11],xpd=T)
+
+xi <- cumsum(table(pd5$Patient.ID))
+mid.xi <- (xx[xi] + xx[xi+1])/2
+abline(v=mid.xi,lty=2)
+dev.off()
+
+col1 <- RColorBrewer::brewer.pal(11,"Set3")[rep(seq(11),length=nlevels(pd5$Patient.ID))]
+names(col1) <- unique(pd5$Patient.ID)
+col2 <- c("grey20","grey80")
+names(col2) <- c("MUT","WT")
+col3 <- RColorBrewer::brewer.pal(length(unique(pd5$TimePoint)),"Set2")
+names(col3) <- c("BS","BX2","BX3")
+col4 <- RColorBrewer::brewer.pal(length(unique(pd5$BOR)),"Set1")[c(1,3,2)]
+names(col4) <- levels(pd5$BOR)
+col5 <- RColorBrewer::brewer.pal(length(unique(pd5$Subtype)),"Dark2")[2:1]
+names(col5) <- levels(pd5$Subtype)  
+col6 <- colorRampPalette(blues9)(round(sqrt(max(pd5$PFS_days))))
+
+rsc <- list(
+  Patient.ID = col1[pd5$Patient.ID],
+  BRCA = col2[pd5$BRCA],
+  TimePoint = col3[pd5$TimePoint],
+  BOR = col4[pd5$BOR],
+  Subtype = col5[pd5$Subtype],
+  PFS = col6[round(sqrt(pd5$PFS_days))])[rev(c("BRCA","Subtype","BOR","PFS","Patient.ID","TimePoint"))]
+
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency", "color_palette_all_ct5.pdf"),width=12,height=7)
+par(mfrow=c(6,1))
+par(oma=c(5,5,5,5))
+for(nm in names(rsc)){
+  par(mar=c(0,0,0,0))
+  image(seq(nrow(pd5)),1,as.matrix(seq(nrow(pd5))),col=rsc[[nm]],axes=F,xlab="",ylab="",main="")
+}
+dev.off()
+
+n_colors <- 256
+col6 <- colorRampPalette(blues9)(n_colors)
+sqrt_breaks <- seq(0,sqrt(max(pd5$PFS_days, na.rm = TRUE)), length.out = n_colors + 1)
+pfs_vals <- sqrt_breaks^2
+yvals <- c(0, 1)
+z <- matrix(1:n_colors, nrow = 1)
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency", "color_palette_pfs_ct5.pdf"),width=12,height=7)
+par(mar = c(2, 4, 4, 2))
+image(x = pfs_vals, y = yvals, z = t(z), col = col6, axes = FALSE, xlab = "", ylab = "")
+axis(3, at = pretty(pfs_vals), labels = pretty(pfs_vals))
+box()
+dev.off()
+```
+
+```{r}
+if(0){
+  # Optional QC: export slide-level cell-type maps for manual review of sample composition.
+  export_cycif_slide_celltype_plots(
+    cs5 = cs5,
+    cs7 = cs7,
+    pd5 = pData(cs5),
+    ct_cols = ct.cols7,
+    out_dir = file.path(cycif_fig_dir, "misc", "qc", "slides")
+  )
+}
+```
+
+## ---- Tumor Frequency Analysis ----
+
+### Prepare Tumor Frequency Data
+```{r}
+n7 <- apply(table(cell_types(cs7))[,uniq.cts],1,function(x)x/sum(x))
+
+xs <- barplot(n7[11:1,],beside=F,col=rev(ct.cols7),plot=FALSE)
+pid <- table(pd7 %>% filter(id %in% names(cs7)) %>% pull(Patient.ID))
+pid <- pid[pid!=0]
+
+x1 <- xs[cumsum(pid)]
+x2 <- xs[cumsum(pid)+1]
+xs7 <- (x1+x2)/2
+
+uniq.ids7 <- as.character(pd7$id)
+
+
+n5 <- apply(table(cell_types(cs5))[,uniq.cts],1,function(x)x/sum(x))
+
+xs <- barplot(n5[11:1,],beside=F,col=rev(ct.cols7),plot=FALSE)
+pid <- table(pd5 %>% filter(id %in% names(cs5)) %>% pull(Patient.ID))
+pid <- pid[pid!=0]
+
+x1 <- xs[cumsum(pid)]
+x2 <- xs[cumsum(pid)+1]
+xs5 <- (x1+x2)/2
+
+uniq.ids5 <- as.character(pd5$id)
+
+
+n57 <- n5
+identical(rownames(n5),rownames(n7))
+n57[,nms7] <- n7[,nms7]
+
+```
+### [Fig 2B] Tumor cell freq with `cs5` - with `plot_ct` function
+
+```{r}
+ctfreq57 <- array(NA,dim=c(nrow(n57),ncol(n57)))
+ctfreq57[,] <- n57
+rownames(ctfreq57) <- rownames(n57)
+colnames(ctfreq57) <- colnames(n57)
+
+df.57 <- prepare_tumor_frequency_df(ctfreq57, pd5)
+df.5 <- prepare_tumor_frequency_df(apply(table(cell_types(cs5))[,uniq.cts],1,function(x)x/sum(x)), pd5)
+df.7 <- prepare_tumor_frequency_df(apply(table(cell_types(cs7))[,uniq.cts],1,function(x)x/sum(x)), pd7)
+
+p1 <- plot_ct(df.5 ,y_var="Tumor",y_label="Tumor frequency",title="Tumor frequency",pt.cols=pt.cols)
+p2 <- plot_ct(df.7 ,y_var="Tumor",y_label="Tumor frequency",title="Tumor frequency",pt.cols=pt.cols)
+p3 <- plot_ct(df.57 ,y_var="Tumor",y_label="Tumor frequency",title="Tumor frequency",pt.cols=pt.cols)
+
+if(!dir.exists(file.path(cycif_fig_dir, "cell_type", "frequency"))){
+  dir.create(file.path(cycif_fig_dir, "cell_type", "frequency"),recursive=TRUE)
+}
+
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency", "tumor_freq_merged_v2.pdf"),width=5,height=7)
+print(p3$plot)
+dev.off()
+
+```
+## ---- Cell-Type Frequency Plots ----
+### Generate Cell-Type Frequency Plots
+Use `cs5` for cell types in `cts.in.5` and `cs7` for cell types in `cts.in.7only`.
+
+```{r}
+n.ctf5 <- build_augmented_celltype_frequency(cs5)
+nm.ratios <- rownames(n.ctf5)
+df.ctf5 <- prepare_sample_frequency_df(n.ctf5, pd5)
+```
+
+```{r}
+n.ctf7 <- build_augmented_celltype_frequency(cs7)
+nm.ratios <- rownames(n.ctf7)
+df.ctf7 <- prepare_sample_frequency_df(n.ctf7, pd7)
+```
+
+```{r}
+cmp.conds7 <- rownames(n.ctf7)
+is7 <- sub("\\..+","",cmp.conds7) %in% cts.in.7only
+names(is7) <- cmp.conds7
+
+conds.bt3 <- list()
+
+for(con in cmp.conds7){
+  if(is7[con]){
+    df.ctf <- df.ctf7
+  }else{
+    df.ctf <- df.ctf5
+  }
+  this.con <- strsplit(con,"\\.")[[1]]
+  p <- plot_ct(df.ctf,y_var=con,
+               y_label=paste0("Cell type frequency (",this.con[1],"/",this.con[2],")"),
+               title=sub("\\.","/",con),pt.cols=pt.cols)
+  conds.bt3[[con]] <- p$stat
+
+  if(1){
+    pdf(file.path(cycif_fig_dir, "cell_type", "frequency", paste0("ct_freq_",con,".pdf")),width=5,height=7)
+    print(p$plot)
+    dev.off()
+  }
+}
+```
+
+### Model Diagnostics: Normality Check (pooled across all cell-type/marker frequency variables, standardized)
+
+Residuals standardized per variable before pooling, to avoid a scale-mixing artifact that
+would otherwise look leptokurtic regardless of true normality.
+```{r}
+diag_ct_vars <- cmp.conds7
+
+diag_ct_residuals_list <- lapply(diag_ct_vars, function(con) {
+  df.ctf <- if (is7[con]) df.ctf7 else df.ctf5
+  get_ct_freq_lmer_residuals(df.ctf, con)
+})
+
+diag_ct_residuals_std <- lapply(diag_ct_residuals_list, function(r) {
+  if (is.null(r) || length(r) < 2) return(NULL)
+  s <- sd(r)
+  if (!is.finite(s) || s == 0) return(NULL)
+  r / s
+}) %>% unlist(use.names = FALSE)
+
+cat("n cell-type/marker frequency variables:", length(diag_ct_vars),
+    " | n pooled standardized residuals:", length(diag_ct_residuals_std), "\n")
+
+qqnorm(diag_ct_residuals_std, main = "Q-Q plot of pooled residuals: CyCIF frequency LMER family (all variables, standardized per variable)")
+qqline(diag_ct_residuals_std)
+
+set.seed(1)
+n_draws <- 20
+draw_size <- 1000
+
+shapiro_summary_ct <- run_shapiro_draws(diag_ct_residuals_std, draw_size, n_draws)
+
+cat(sprintf(
+  "Shapiro-Wilk across %d draws of n=%d:\n  W: median=%.4f, range=[%.4f, %.4f]\n  p: median=%.2e, range=[%.2e, %.2e]\n",
+  n_draws, draw_size,
+  median(shapiro_summary_ct$W), min(shapiro_summary_ct$W), max(shapiro_summary_ct$W),
+  median(shapiro_summary_ct$p), min(shapiro_summary_ct$p), max(shapiro_summary_ct$p)
+))
+
+shapiro_summary_ct
+```
+
+### [Fig 5A, EDF7A] Heatmap of Frequency Changes Between Time Points
+
+```{r}
+
+heatmap_inputs <- prepare_signed_logp_heatmap_inputs(conds.bt3)
+mat_val_filt <- heatmap_inputs$mat_val_filt
+mat_val_filt1 <- heatmap_inputs$mat_val_filt1
+tier_ps <- heatmap_inputs$tier_ps
+tier_ps1 <- heatmap_inputs$tier_ps1
+col_fun <- heatmap_inputs$col_fun
+ann_colors <- heatmap_inputs$ann_colors
+col_annot <- heatmap_inputs$col_annot
+col_annot1 <- heatmap_inputs$col_annot1
+```
+
+```{r}
+ht_ps <- build_signed_logp_heatmap(
+  mat = mat_val_filt,
+  tier_mat = tier_ps,
+  annotation_df = col_annot,
+  ann_colors = ann_colors,
+  col_fun = col_fun
+)
+```
+
+```{r}
+lgd_sig_cycif <- Legend(
+  labels = c("FDR < 0.05", "nominal p < 0.05"),
+  title = "Significance",
+  type = "lines",
+  legend_gp = gpar(col = c("black", "grey50"), lwd = c(2, 1.5))
+)
+
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency_heatmap", "sig_signed_logps_heatmap_merged_v3.pdf"),
+    width = 5, height = 7)
+ComplexHeatmap::draw(ht_ps, heatmap_legend_side = "right", annotation_legend_list = list(lgd_sig_cycif))
+dev.off()
+
+ht_ps1 <- build_signed_logp_heatmap(
+  mat = mat_val_filt1,
+  tier_mat = tier_ps1,
+  annotation_df = col_annot1,
+  ann_colors = ann_colors,
+  col_fun = col_fun
+)
+
+pdf(file.path(cycif_fig_dir, "cell_type", "frequency_heatmap", "sig_signed_logps_heatmap_merged_full_v3.pdf"),
+    width = 7, height = 7)
+ComplexHeatmap::draw(ht_ps1, heatmap_legend_side = "right", annotation_legend_list = list(lgd_sig_cycif))
+dev.off()
+```
+
+## ---- Marker-Positive Cell Frequency ----
+### Prepare Marker-Positive Cell Frequencies
+```{r}
+exp.th5 <- exprs(cs5,type="logTh")
+exp.log5 <- exprs(cs5,type="log")
+exp.th7 <- exprs(cs7,type="logTh")
+exp.log7 <- exprs(cs7,type="log")
+
+cst <- cs7@cell_types$default@cell_state_def
+cst.abs <- colnames(cst)
+uniq.cts1 <- unique(sub("Tumor_.+","Tumor",uniq.cts))
+uniq.cts1 <- uniq.cts1[!uniq.cts1 %in% c("Immune_other","all_other")]
+
+mats.fr <- list()
+
+for(ab in cst.abs){
+  this.cts <- cst %>% filter(!is.na(!!sym(ab)) & !!sym(ab) == "CAN") %>% rownames()
+
+  if(ab %in% abs.5){
+    cts <- cts5
+    exp.th <- exp.th5
+    exp.log <- exp.log5
+    pd <- pd5
+  }else{
+    cts <- cts7
+    exp.th <- exp.th7
+    exp.log <- exp.log7
+    pd <- pd7
+  }
+
+  marker_tables <- prepare_marker_positive_frequency_tables(
+    cts = cts,
+    exp_th = exp.th,
+    exp_log = exp.log,
+    pd = pd,
+    ab = ab,
+    this_cts = this.cts
+  )
+  mats.fr[[ab]] <- marker_tables$mat_fr
+}
+```
+
+### [Fig 3G, EDF6D] Marker-Positive Frequencies by Cell Type
+
+gH2AX/pTBK1 marker-positive frequencies -> Fig.3G; PD1 marker-positive frequencies
+(`pos_freq_PD1_<CD4T/CD8T/T_other>_v4.pdf`) -> EDF6D.
+```{r}
+d1 <- file.path(cycif_fig_dir, "marker_frequency", "individual", "individual")
+if(!dir.exists(d1)){
+  dir.create(d1, recursive = TRUE)
+}
+
+for(ab in cst.abs){
+  if(ab %in% abs.5){
+    pd <- pd5
+  }else{
+    pd <- pd7
+  }
+  mat.fr <- as.data.frame(mats.fr[[ab]]) %>%
+    rownames_to_column("sample") %>%
+    mutate(sample = factor(sample, levels = levels(pd$id))) %>%
+    pivot_longer(-sample, names_to = "cell_types", values_to = "pos_frac") %>%
+    left_join(pd %>% select(id, bt3), by = c("sample" = "id")) %>%
+    mutate(
+      cell_types = factor(cell_types,levels=uniq.cts1)
+    )
+
+  if(length(unique(mat.fr$cell_types)) > 1){
+    df <- mats.fr[[ab]] %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("id") %>%
+      left_join(pd %>% select(id,BRCA,TimePoint,PFS_days,Patient.ID,BOR,bt3), by = "id")
+
+    df <- df %>%
+      group_by(Patient.ID) %>%
+      mutate(
+        max_bn = max(as.numeric(TimePoint)),
+        text = ifelse(as.numeric(TimePoint) == max_bn,as.character(Patient.ID),"")
+      ) %>%
+      ungroup()
+
+    this.cts <- colnames(mats.fr[[ab]])
+
+    for(ct in this.cts){
+      df1 <- df %>% filter(!is.na(!!sym(ct)))
+      p <- plot_ct(df1, y_var = ct, y_label = paste0("Positive fraction in ",ct),
+        title = paste0(ab, " positive fraction in ",ct),
+        pt.cols = pt.cols)
+      pdf(file.path(d1, paste0("pos_freq_", ab, "_",ct,"_v4.pdf")), width = 5, height = 7)
+      print(p$plot)
+      dev.off()
+    }
+  }else{
+    ct <- as.character(mat.fr$cell_types[1])
+
+    mat.fr <- mat.fr %>%
+      select(1:3) %>%
+      left_join(pd %>% select(id,BRCA,TimePoint,PFS_days,Patient.ID,BOR,bt3), by = c("sample" = "id"))
+
+    p <- plot_ct(mat.fr, y_var = "pos_frac", y_label = paste0("Positive fraction in ",ct),
+        title = paste0(ab, " positive fraction in ",ct),
+        pt.cols = pt.cols)
+
+    pdf(file.path(d1, paste0("pos_freq_", ab, "_",ct,"_v4.pdf")), width = 5, height = 7)
+    print(p$plot)
+    dev.off()
+  }
+}
+```
+### [Fig 3G (right)] Tumor gH2AX/pTBK1 Double-Positive Fraction
+
+`pos_freq_gH2AX_pTBK1_Tumor_v4.pdf` -> Fig.3G right (paired with the single-marker
+`pos_freq_gH2AX_Tumor_v4.pdf`/`pos_freq_pTBK1_Tumor_v4.pdf` -> Fig.3G left/middle, generated
+in the main marker-positive-frequency loop above). `emmeans_gH2AX_pTBK1_v4.pdf` not
+confirmed used.
+```{r}
+ab1 <- "gH2AX"
+ab2 <- "pTBK1"
+
+cts <- cts7
+exp.th <- exp.th7
+pd <- pd7
+
+uniq.cts1 <- unique(sub("Tumor_.+","Tumor",uniq.cts))
+uniq.cts1 <- uniq.cts1[!uniq.cts1 %in% c("Immune_other","all_other")]
+
+mat.fr <- prepare_double_positive_frequency_df(
+  cts = cts,
+  exp_th = exp.th,
+  pd = pd,
+  ab1 = ab1,
+  ab2 = ab2,
+  selected_cts = "Tumor"
+) %>%
+  mutate(cell_types = factor(cell_types, levels = uniq.cts1))
+
+ct <- "Tumor"
+p <- plot_ct(mat.fr, y_var = "pos_frac", y_label = paste0("Positive fraction in ",ct),
+    title = paste0(ab1,"/",ab2, " double-positive fraction in ",ct),
+  pt.cols = pt.cols)
+
+pdf(file.path(d1, paste0("pos_freq_", ab1,"_",ab2, "_",ct,"_v4.pdf")), width = 5, height = 7)
+print(p$plot)
+dev.off()
+
+```
+
+## ---- T Cell Stratification ----
+### Prepare `CD8T`
+```{r}
+nms5 <- names(cs5)
+non_cd8t.ts <- cd8.ts <- list()
+
+for(nm in nms5){
+  tmp <- cs5[[nm]]
+  cts <- cell_types(tmp)
+  is.cd8t <- cts$cell_types == "CD8T"
+  is.non_cd8t <- cts$cell_types == "T_other"
+  
+
+  ex <- exprs(tmp,type="logTh")
+
+  ## CD8T  
+  if(sum(is.cd8t,na.rm=T)){
+    pd1 <- ex[is.cd8t,"PD1"]
+    grb <- ex[is.cd8t,"GrB"]
+    tab <- matrix(0,nrow=2,ncol=2)
+    colnames(tab) <- rownames(tab) <- c("TRUE","FALSE")
+    tab1 <- table(pd1=pd1>0.5,GrB=grb>0.5)#[c("TRUE","FALSE"),c("TRUE","FALSE")]
+    tab[rownames(tab1),colnames(tab1)] <- tab1
+    tab <- as.vector(tab)
+  }else{
+    tab <- c(0,0,0,0)  # no CD8T cells
+  }    
+  names(tab) <- c("PD1_GrB","GrB","PD1","dn")
+
+  cd8.ts[[nm]] <- tab[c(2,1,3,4)]
+  
+  ## Non-CD8T
+  if(sum(is.non_cd8t,na.rm=T)){
+    pd1 <- ex[is.non_cd8t,"PD1"]
+    grb <- ex[is.non_cd8t,"GrB"]
+    tab <- matrix(0,nrow=2,ncol=2)
+    colnames(tab) <- rownames(tab) <- c("TRUE","FALSE")
+    tab1 <- table(pd1=pd1>0.5,GrB=grb>0.5)#[c("TRUE","FALSE"),c("TRUE","FALSE")]
+    tab[rownames(tab1),colnames(tab1)] <- tab1
+    tab <- as.vector(tab)
+  }else{
+    tab <- c(0,0,0,0)  # no non_cd8t cells
+  }
+  names(tab) <- c("PD1_GrB","GrB","PD1","dn")
+
+  non_cd8t.ts[[nm]] <- tab[c(2,1,3,4)]
+}
+
+cd8.stat <- do.call(rbind,cd8.ts)
+n.cd8 <- apply(cd8.stat,1,function(x)x/sum(x))
+n.cd8[,"1011-2"] <- 0
+
+non_cd8t.stat <- do.call(rbind,non_cd8t.ts)
+n.non_cd8t <- apply(non_cd8t.stat,1,function(x)x/sum(x))
+n.non_cd8t[,"1011-2"] <- 0
+
+t_all.stat <- cd8.stat + non_cd8t.stat
+n.t_all <- apply(t_all.stat,1,function(x)x/sum(x))
+```
+### Prepare `CD4T`/`T_other`
+```{r}
+nms7 <- names(cs7)
+t_other.ts <- cd4.ts <- list()
+
+for(nm in nms7){
+  tmp <- cs7[[nm]]
+  cts <- cell_types(tmp)
+  is.cd4t <- cts$cell_types == "CD4T"
+  is.t_other <- cts$cell_types == "T_other"
+
+  ex <- exprs(tmp,type="logTh")
+
+  ## CD4T  
+  if(sum(is.cd4t,na.rm=T)){
+    pd1 <- ex[is.cd4t,"PD1"]
+    grb <- ex[is.cd4t,"GrB"]
+    tab <- matrix(0,nrow=2,ncol=2)
+    colnames(tab) <- rownames(tab) <- c("TRUE","FALSE")
+    tab1 <- table(pd1=pd1>0.5,GrB=grb>0.5)#[c("TRUE","FALSE"),c("TRUE","FALSE")]
+    tab[rownames(tab1),colnames(tab1)] <- tab1
+    tab <- as.vector(tab)
+  }else{
+    tab <- c(0,0,0,0)  # no CD4T cells
+  }    
+  names(tab) <- c("PD1_GrB","GrB","PD1","dn")
+
+  cd4.ts[[nm]] <- tab[c(2,1,3,4)]
+  
+  ## T_other
+  if(sum(is.t_other,na.rm=T)){
+    pd1 <- ex[is.t_other,"PD1"]
+    grb <- ex[is.t_other,"GrB"]
+    tab <- matrix(0,nrow=2,ncol=2)
+    colnames(tab) <- rownames(tab) <- c("TRUE","FALSE")
+    tab1 <- table(pd1=pd1>0.5,GrB=grb>0.5)#[c("TRUE","FALSE"),c("TRUE","FALSE")]
+    tab[rownames(tab1),colnames(tab1)] <- tab1
+    tab <- as.vector(tab)
+  }else{
+    tab <- c(0,0,0,0)  # no T_other cells
+  }
+  names(tab) <- c("PD1_GrB","GrB","PD1","dn")
+
+  t_other.ts[[nm]] <- tab[c(2,1,3,4)]
+}
+
+cd4.stat <- do.call(rbind,cd4.ts)
+n.cd4 <- apply(cd4.stat,1,function(x)x/sum(x))
+t_other.stat <- do.call(rbind,t_other.ts)
+n.t_other <- apply(t_other.stat,1,function(x)x/sum(x))
+```
+
+### [Fig 4H, EDF6C, EDF6G] T-Cell States vs PFS
+
+`TC_state/T_other_PD1_pfs_w_pval.pdf` -> EDF6C. `TC_state/CD4T_PD1_pfs_w_pval.pdf`,
+`TC_state/CD4T_PD1GrB_pfs_w_pval.pdf`, `TC_state/CD8T_PD1_pfs_w_pval.pdf`,
+`TC_state/CD8T_PD1GrB_pfs_w_pval.pdf`, `TC_state/T_other_PD1_pfs_w_pval.pdf`,
+`TC_state/T_other_PD1GrB_pfs_w_pval.pdf` -> EDF6G (note `T_other_PD1_pfs_w_pval.pdf` is
+shared between EDF6C and EDF6G, per author).
+
+```{r}
+n1 <- (t(n.cd8[c(2,1,3,4),]) %>% 
+     as.data.frame() %>% 
+     mutate(PD1_all = PD1 + PD1_GrB) %>%
+     mutate(GrB_all = GrB + PD1_GrB) %>%       
+     tibble::rownames_to_column("id"))
+
+n2 <- (t(n.t_other[c(2,1,3,4),]) %>% 
+     as.data.frame() %>% 
+     mutate(PD1_all = PD1 + PD1_GrB) %>%
+     mutate(GrB_all = GrB + PD1_GrB) %>%              
+     tibble::rownames_to_column("id"))
+
+n4 <- (t(n.cd4[c(2,1,3,4),]) %>%
+     as.data.frame() %>% 
+     mutate(PD1_all = PD1 + PD1_GrB) %>%
+     mutate(GrB_all = GrB + PD1_GrB) %>%       
+     tibble::rownames_to_column("id"))
+
+pd5 <- pd5 %>%
+  mutate(BRCA = as.character(BRCA)) %>%
+  mutate(Patient.ID = factor(Patient.ID))
+
+pd7 <- pd7 %>%
+  mutate(BRCA = as.character(BRCA)) %>%
+  mutate(Patient.ID = factor(Patient.ID))
+
+pd.cd8 <- pd5 %>% left_join(n1,by="id")
+pd.t_other <- pd5 %>% left_join(n2,by="id")
+pd.cd4 <- pd7 %>% left_join(n4,by="id")
+
+eps <- 0.5
+pd.ratio <-n1[c(1,6)] %>%
+  left_join(n4[c(1,6)],by="id",suffix=c("_cd8","_cd4")) %>%
+  filter(!is.na(PD1_all_cd8) & !is.na(PD1_all_cd4)) %>%
+  mutate(ratio = (PD1_all_cd8 + eps)/(PD1_all_cd4 + eps)) %>%
+  mutate(log2ratio = log2(ratio)) %>%
+  left_join(pd7 %>% select(id,BRCA,TimePoint,PFS_days,Patient.ID,BOR,Subtype),by="id")
+hist(pd.ratio$log2ratio)
+```
+
+#### CD8T
+```{r}
+markers <- c("PD1_all", "PD1_GrB", "GrB_all","PD1","GrB","dn")
+titles <- c(
+  PD1_all = "PD-1+ CD8T cells",
+  PD1_GrB = "PD-1+/GrB+ CD8T cells",
+  GrB_all = "GrB+ CD8T cells",
+  PD1 = "PD-1+/GrB- CD8T cells",
+  GrB = "PD-1-/GrB+ CD8T cells",
+  dn = "PD-1-/GrB- CD8T cells"
+)
+xlabels <- c(
+  PD1_all = "% PD-1+ cells (out of CD8T cells)",
+  PD1_GrB = "% PD-1+/GrB+ cells (out of CD8T cells)",
+  GrB_all = "% GrB+ cells (out of CD8T cells)",
+  PD1 = "% PD-1+/GrB- cells (out of CD8T cells)",
+  GrB = "% PD-1-/GrB+ cells (out of CD8T cells)",
+  dn = "% PD-1-/GrB- cells (out of CD8T cells)"
+)
+filenames <- c(
+  PD1_all = "CD8T_PD1_all_pfs_w_pval.pdf",
+  PD1_GrB = "CD8T_PD1GrB_pfs_w_pval.pdf",
+  GrB_all = "CD8T_GrB_all_pfs_w_pval.pdf",
+  PD1 = "CD8T_PD1_pfs_w_pval.pdf",
+  GrB = "CD8T_GrB_pfs_w_pval.pdf",
+  dn = "CD8T_dn_pfs_w_pval.pdf"
+)
+
+for (marker in markers) {
+  p.vals <- matrix(NA, nrow = 2, ncol = 3, dimnames = list(c("MUT", "WT"), c("BS", "BX2", "BX3")))
+  r.adj <- p.vals.marker <- p.vals
+  
+  for (brca in c("MUT", "WT")) {
+    for (tp in c("BS", "BX2", "BX3")) {
+      x <- pd.cd8 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(!!sym(marker))
+      y <- pd.cd8 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(PFS_days)
+      if (length(x) > 1 && length(unique(x)) > 1) {
+        lm1 <- lm(log(y) ~ x)
+        p.vals.marker[brca, tp] <- summary(lm1)$coefficients[2, 4]
+        r.adj[brca, tp] <- summary(lm1)$r.squared
+      }
+    }
+  }
+
+  df.cd8 <- melt(p.vals.marker, varnames = c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(
+      melt(r.adj, varnames = c("BRCA", "TimePoint"), value.name = "r-sq"),
+      by = c("BRCA", "TimePoint")
+    ) %>%
+    mutate(txt = paste0("p=", round(`p-val`, 3), "\nR2=", round(`r-sq`, 3))) %>%
+    mutate(
+      y = case_when(
+        BRCA == "MUT" ~ 400,
+        BRCA == "WT" ~ 150,
+        TRUE ~ 0.025
+      ),
+      x = case_when(
+        marker == "PD1_all" ~ 0.125,
+        marker == "PD1_GrB" ~ 0.15,
+        marker == "GrB_all" ~ 0.25,        
+        marker == "PD1" ~ c(0.2,0.4,0.2,0.125,0.3,0.8),
+        marker == "GrB" ~ 0.06,
+        marker == "dn" ~ c(0.7,0.4,0.7,0.125,0.7,0.15)
+      )
+    )
+
+  p <- ggplot(pd.cd8, aes_string(x = marker, y = "PFS_days", color = "BRCA", label = "Patient.ID")) +
+    scale_y_log10() +
+    geom_point(aes(shape = Subtype)) +
+    scale_color_manual(values = brca.mids) + 
+    facet_wrap(~TimePoint) +
+    labs(
+      title = titles[[marker]],
+      x = xlabels[[marker]],
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text_repel() +
+    geom_text(data = df.cd8, aes(x = x, y = y, label = txt), size = 5, color = 1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", filenames[[marker]]), width = 12, height = 4)
+  print(p)
+  dev.off()
+}
+```
+
+```{r}
+markers <- c("PD1_all", "PD1_GrB", "GrB_all")
+titles <- c(
+  PD1_all = "PD-1+ in CD8T cells",
+  PD1_GrB = "PD-1+/GrB+ in CD8T cells",
+  GrB_all = "GrB+ in CD8T cells"
+)
+xlabels <- c(
+  PD1_all = "% PD-1+ cells (out of CD8T cells)",
+  PD1_GrB = "% PD-1+/GrB+ cells (out of CD8T cells)",
+  GrB_all = "% GrB+ cells (out of CD8T cells)"
+)
+filenames <- c(
+  PD1_all = "CD8T_PD1_all_pfs_w_pval.pdf",
+  PD1_GrB = "CD8T_PD1GrB_pfs_w_pval.pdf",
+  GrB_all = "CD8T_GrB_all_pfs_w_pval.pdf"
+)
+
+for (marker in markers) {
+  p.vals <- matrix(NA, nrow = 2, ncol = 3, dimnames = list(c("MUT", "WT"), c("BS", "BX2", "BX3")))
+  r.adj.cd8 <- p.vals.cd8 <- p.vals
+  
+  for (brca in c("MUT", "WT")) {
+    for (tp in c("BS", "BX2", "BX3")) {
+      x <- pd.cd8 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(!!sym(marker))
+      y <- pd.cd8 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(PFS_days)
+      if (length(x) > 1 && length(unique(x)) > 1) {
+        lm1 <- lm(log(y) ~ x)
+        p.vals.cd8[brca, tp] <- summary(lm1)$coefficients[2, 4]
+        r.adj.cd8[brca, tp] <- summary(lm1)$r.squared
+      }
+    }
+  }
+
+  df.cd8 <- melt(p.vals.cd8, varnames = c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(
+      melt(r.adj.cd8, varnames = c("BRCA", "TimePoint"), value.name = "r-sq"),
+      by = c("BRCA", "TimePoint")
+    ) %>%
+    mutate(txt = paste0("p=", round(`p-val`, 3), "\nR2=", round(`r-sq`, 3))) %>%
+    mutate(x = c(0.2,0.2,0.2,0.5,0.2,0.2),
+           y = c(400,75,500,50,350,75))
+
+  p <- ggplot(pd.cd8, aes_string(x = marker, y = "PFS_days", color = "BRCA", label = "Patient.ID")) +
+    scale_y_log10() +
+    geom_point(aes(shape = Subtype)) +
+    scale_color_manual(values = brca.mids) + 
+    facet_wrap(~TimePoint) +
+    labs(
+      title = titles[[marker]],
+      x = xlabels[[marker]],
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text_repel() +
+    geom_text(data = df.cd8, aes(x = x, y = y, label = txt), size = 5, color = 1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", filenames[[marker]]), width = 12, height = 4)
+  print(p)
+  dev.off()
+}
+```
+
+
+#### CD4T
+```{r}
+markers <- c("PD1_all", "PD1_GrB", "GrB_all","PD1","GrB","dn")
+titles <- c(
+  PD1_all = "PD-1+ CD4T cells",
+  PD1_GrB = "PD-1+/GrB+ CD4T cells",
+  GrB_all = "GrB+ CD4T cells",
+  PD1 = "PD-1+/GrB- CD4T cells",
+  GrB = "PD-1-/GrB+ CD4T cells",
+  dn = "PD-1-/GrB- CD4T cells"
+)
+xlabels <- c(
+  PD1_all = "% PD-1+ cells (out of CD4T cells)",
+  GrB_all = "% GrB+ cells (out of CD4T cells)",
+  PD1_GrB = "% PD-1+/GrB+ cells (out of CD4T cells)",
+  PD1 = "% PD-1+/GrB- cells (out of CD4T cells)",
+  GrB = "% PD-1-/GrB+ cells (out of CD4T cells)",
+  dn = "% PD-1-/GrB- cells (out of CD4T cells)"
+)
+filenames <- c(
+  PD1_all = "CD4T_PD1_all_pfs_w_pval.pdf",
+  PD1_GrB = "CD4T_PD1GrB_pfs_w_pval.pdf",
+  GrB_all = "CD4T_GrB_all_pfs_w_pval.pdf",
+  PD1 = "CD4T_PD1_pfs_w_pval.pdf",
+  GrB = "CD4T_GrB_pfs_w_pval.pdf",
+  dn = "CD4T_dn_pfs_w_pval.pdf"
+)
+
+for (marker in markers) {
+  p.vals <- matrix(NA, nrow = 2, ncol = 3, dimnames = list(c("MUT", "WT"), c("BS", "BX2", "BX3")))
+  r.adj <- p.vals.marker <- p.vals
+  
+  for (brca in c("MUT", "WT")) {
+    for (tp in c("BS", "BX2", "BX3")) {
+      x <- pd.cd4 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(!!sym(marker))
+      y <- pd.cd4 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(PFS_days)
+      if (length(x) > 1 && length(unique(x)) > 1) {
+        lm1 <- lm(log(y) ~ x)
+        p.vals.marker[brca, tp] <- summary(lm1)$coefficients[2, 4]
+        r.adj[brca, tp] <- summary(lm1)$r.squared
+      }
+    }
+  }
+
+  df.cd4 <- melt(p.vals.marker, varnames = c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(
+      melt(r.adj, varnames = c("BRCA", "TimePoint"), value.name = "r-sq"),
+      by = c("BRCA", "TimePoint")
+    ) %>%
+    mutate(txt = paste0("p=", round(`p-val`, 3), "\nR2=", round(`r-sq`, 3))) %>%
+    mutate(
+      y = case_when(
+        BRCA == "MUT" ~ 400,
+        BRCA == "WT" ~ 150,
+        TRUE ~ 0.025
+      ),
+      x = case_when(
+        marker == "PD1_all" ~ c(0.4,0.4,0.4,0.4,0.3,0.7),
+        marker == "PD1_GrB" ~ 0.04,
+        marker == "GrB_all" ~ 0.05,        
+        marker == "PD1" ~ c(0.4,0.4,0.4,0.4,0.4,0.8),
+        marker == "GrB" ~ 0.04,
+        marker == "dn" ~ c(0.5,0.5,0.5,0.4,0.2,0.5)
+      )
+    )
+
+  p <- ggplot(pd.cd4, aes_string(x = marker, y = "PFS_days", color = "BRCA", label = "Patient.ID")) +
+    scale_y_log10() +
+    geom_point(aes(shape = Subtype)) +
+    scale_color_manual(values = brca.mids) + 
+    facet_wrap(~TimePoint) +
+    labs(
+      title = titles[[marker]],
+      x = xlabels[[marker]],
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text_repel() +
+    geom_text(data = df.cd4, aes(x = x, y = y, label = txt), size = 5, color = 1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", filenames[[marker]]), width = 12, height = 4)
+  print(p)
+  dev.off()
+}
+```
+
+```{r}
+markers <- c("PD1_all", "PD1_GrB", "GrB_all")
+titles <- c(
+  PD1_all = "PD-1+ in CD4T cells",
+  PD1_GrB = "PD-1+/GrB+ in CD4T cells",
+  GrB_all = "GrB+ in CD4T cells"
+)
+xlabels <- c(
+  PD1_all = "% PD-1+ cells (out of CD4T cells)",
+  PD1_GrB = "% PD-1+/GrB+ cells (out of CD4T cells)",
+  GrB_all = "% GrB+ cells (out of CD4T cells)"
+)
+filenames <- c(
+  PD1_all = "CD4T_PD1_all_pfs_w_pval.pdf",
+  PD1_GrB = "CD4T_PD1GrB_pfs_w_pval.pdf",
+  GrB_all = "CD4T_GrB_all_pfs_w_pval.pdf"
+)
+
+for (marker in markers) {
+  p.vals <- matrix(NA, nrow = 2, ncol = 3, dimnames = list(c("MUT", "WT"), c("BS", "BX2", "BX3")))
+  r.adj.cd4 <- p.vals.cd4 <- p.vals
+  
+  for (brca in c("MUT", "WT")) {
+    for (tp in c("BS", "BX2", "BX3")) {
+      x <- pd.cd4 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(!!sym(marker))
+      y <- pd.cd4 %>% filter(BRCA == brca, TimePoint == tp) %>% pull(PFS_days)
+      if (length(x) > 1 && length(unique(x)) > 1) {
+        lm1 <- lm(log(y) ~ x)
+        p.vals.cd4[brca, tp] <- summary(lm1)$coefficients[2, 4]
+        r.adj.cd4[brca, tp] <- summary(lm1)$r.squared
+      }
+    }
+  }
+
+  df.cd4 <- melt(p.vals.cd4, varnames = c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(
+      melt(r.adj.cd4, varnames = c("BRCA", "TimePoint"), value.name = "r-sq"),
+      by = c("BRCA", "TimePoint")
+    ) %>%
+    mutate(txt = paste0("p=", round(`p-val`, 3), "\nR2=", round(`r-sq`, 3))) %>%
+    mutate(
+      y = case_when(
+        BRCA == "MUT" ~ 400,
+        BRCA == "WT" ~ 150,
+        TRUE ~ 0.025
+      ),
+      x = case_when(
+        marker == "PD1_all" ~ c(0.4,0.4,0.4,0.8,0.4,0.4),
+        marker == "PD1_GrB" ~ 0.15,
+        marker == "GrB_all" ~ 0.02)
+      )
+
+  p <- ggplot(pd.cd4, aes_string(x = marker, y = "PFS_days", color = "BRCA", label = "Patient.ID")) +
+    scale_y_log10() +
+    geom_point(aes(shape = Subtype)) +
+    scale_color_manual(values = brca.mids) + 
+    facet_wrap(~TimePoint) +
+    labs(
+      title = titles[[marker]],
+      x = xlabels[[marker]],
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text_repel() +
+    geom_text(data = df.cd4, aes(x = x, y = y, label = txt), size = 5, color = 1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", filenames[[marker]]), width = 12, height = 4)
+  print(p)
+  dev.off()
+}
+```
+#### T_other
+```{r}
+markers <- c("PD1_all", "PD1_GrB", "GrB_all","PD1","GrB","dn")
+titles <- c(
+  PD1_all = "PD-1+ T_other cells",
+  PD1_GrB = "PD-1+/GrB+ T_other cells",
+  GrB_all = "GrB+ T_other cells",
+  PD1 = "PD-1+/GrB- T_other cells",
+  GrB = "PD-1-/GrB+ T_other cells",
+  dn = "PD-1-/GrB- T_other cells"
+)
+xlabels <- c(
+  PD1_all = "% PD-1+ cells (out of T_other cells)",
+  PD1_GrB = "% PD-1+/GrB+ cells (out of T_other cells)",
+  GrB_all = "% GrB+ cells (out of T_other cells)",
+  PD1 = "% PD-1+/GrB- cells (out of T_other cells)",
+  GrB = "% PD-1-/GrB+ cells (out of T_other cells)",
+  dn = "% PD-1-/GrB- cells (out of T_other cells)"
+)
+filenames <- c(
+  PD1_all = "T_other_PD1_all_pfs_w_pval.pdf",
+  PD1_GrB = "T_other_PD1GrB_pfs_w_pval.pdf",
+  GrB_all = "T_other_GrB_all_pfs_w_pval.pdf",
+  PD1 = "T_other_PD1_pfs_w_pval.pdf",
+  GrB = "T_other_GrB_pfs_w_pval.pdf",
+  dn = "T_other_dn_pfs_w_pval.pdf"
+)
+
+for (marker in markers) {
+  p.vals <- matrix(NA, nrow = 2, ncol = 3, dimnames = list(c("MUT", "WT"), c("BS", "BX2", "BX3")))
+  r.adj <- p.vals.marker <- p.vals
+  
+  for (brca in c("MUT", "WT")) {
+    for (tp in c("BS", "BX2", "BX3")) {
+      x <- pd.t_other %>% filter(BRCA == brca, TimePoint == tp) %>% pull(!!sym(marker))
+      y <- pd.t_other %>% filter(BRCA == brca, TimePoint == tp) %>% pull(PFS_days)
+      if (length(x) > 1 && length(unique(x)) > 1) {
+        lm1 <- lm(log(y) ~ x)
+        p.vals.marker[brca, tp] <- summary(lm1)$coefficients[2, 4]
+        r.adj[brca, tp] <- summary(lm1)$r.squared
+      }
+    }
+  }
+
+  df.t_other <- melt(p.vals.marker, varnames = c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(
+      melt(r.adj, varnames = c("BRCA", "TimePoint"), value.name = "r-sq"),
+      by = c("BRCA", "TimePoint")
+    ) %>%
+    mutate(txt = paste0("p=", round(`p-val`, 3), "\nR2=", round(`r-sq`, 3))) %>%
+    mutate(
+      y = case_when(
+        BRCA == "MUT" ~ 400,
+        BRCA == "WT" ~ 150,
+        TRUE ~ 0.025
+      ),
+      x = case_when(
+        marker == "PD1_all" ~ 0.9,
+        marker == "PD1_GrB" ~ 0.025,
+        marker == "GrB_all" ~ 0.1,        
+        marker == "PD1" ~ c(0.2,0.8,0.2,0.8,0.8,0.8),
+        marker == "GrB" ~ 0.075,
+        marker == "dn" ~ c(0.8,0.25,0.8,0.25,0.1,0.1)
+      )
+    )
+
+  p <- ggplot(pd.t_other, aes_string(x = marker, y = "PFS_days", color = "BRCA", label = "Patient.ID")) +
+    scale_y_log10() +
+    geom_point(aes(shape = Subtype)) +
+    scale_color_manual(values = brca.mids) + 
+    facet_wrap(~TimePoint) +
+    labs(
+      title = titles[[marker]],
+      x = xlabels[[marker]],
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text_repel() +
+    geom_text(data = df.t_other, aes(x = x, y = y, label = txt), size = 5, color = 1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", filenames[[marker]]), width = 12, height = 4)
+  print(p)
+  dev.off()
+}
+```
+
+#### Save Objects
+```{r}
+write.csv(pd.cd8,file=file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", "pd_cd8.csv"),row.names=F)
+write.csv(pd.cd4,file=file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", "pd_cd4.csv"),row.names=F)
+write.csv(pd.t_other,file=file.path(cycif_fig_dir, "marker_frequency", "pfs_by_state", "pd_t_other.csv"),row.names=F)
+```
+
+### [EDF6A, EDF6B] T-Cell Frequency vs PFS
+
+`TC_state_1/CD4T_all_pfs_w_pval.pdf`, `TC_state_1/CD8T_all_pfs_w_pval.pdf` -> EDF6A.
+`TC_state_1/CD8T_PD1_all_pfs_w_pval.pdf`, `TC_state_1/CD4T_PD1_all_pfs_w_pval.pdf`,
+`TC_state_1/T_other_PD1_all_pfs_w_pval.pdf` -> EDF6B.
+#### CD8T
+```{r}
+cd8.stat <- do.call(rbind,cd8.ts)
+cd8.stat <- as.data.frame(cd8.stat) %>% 
+  rownames_to_column("id") %>%
+  mutate(PD1_all=PD1 + PD1_GrB,
+         GrB_all=GrB + PD1_GrB)
+colnames(cd8.stat)[-1] <- paste0("CD8T_",colnames(cd8.stat)[-1])
+
+non_cd8t.stat <- do.call(rbind,non_cd8t.ts)
+non_cd8t.stat <- as.data.frame(non_cd8t.stat) %>% 
+  rownames_to_column("id") %>%
+  mutate(PD1_all=PD1 + PD1_GrB,
+         GrB_all=GrB + PD1_GrB)
+colnames(non_cd8t.stat)[-1] <- paste0("Non_CD8T_",colnames(cd8.stat)[-1])
+
+cts5.1 <- table(cell_types(cs5)) %>%
+  as.data.frame() %>%
+  spread(cell_types,Freq) %>%
+  rename(id="sample") %>%
+  left_join(cd8.stat,by="id")
+
+n.cts5 <- t(apply(cts5.1[-1],1,function(x)x/sum(x[2:12]))) %>% 
+  as.data.frame() %>%
+  mutate(id=cts5.1$id) %>%
+  relocate(id) %>%
+  left_join(pd5,by="id") %>%
+  rename(CD8T_all="CD8T")
+
+t.subs <- c("all","PD1_all","PD1_GrB","GrB_all","PD1","GrB","dn")  
+
+r.sq.cd8 <- p.vals.cd8 <- list()
+xys <- list(
+  all = list(x=c(0.2,0.2,0.2,0.2,0.2,0.2),y=c(600,75,600,75,600,75)),
+  PD1_all = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  PD1_GrB = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  GrB_all = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  PD1 = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  dn = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75))
+)
+
+xys.3 <- list(
+  all = list(x=c(0.128,0.128),y=c(300,90))
+)
+
+
+pretty_titles <- c(
+  all = "all CD8T cells",
+  PD1_all = "PD-1+ CD8T cells",
+  PD1_GrB = "PD-1+/GrB+ CD8T cells",
+  GrB_all = "GrB+ CD8T cells",
+  PD1 = "PD-1+/GrB- CD8T cells",
+  GrB = "PD-1-/GrB+ CD8T cells",
+  dn = "PD-1-/GrB- CD8T cells"
+)
+
+for(ct in t.subs){
+  ct1 <- paste0("CD8T_",ct)
+  r.sq.cd8[[ct1]] <- p.vals.cd8[[ct1]] <- p.vals
+  for(brca in c("MUT","WT")){
+    for(tp in c("BS","BX2","BX3")){
+      x <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(!!sym(ct1))
+      y <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(PFS_days)
+      lm1 <- lm(log(y) ~ x)
+      
+      p.vals.cd8[[ct1]][brca,tp] <- summary(lm1)$coefficients[2,4]
+      r.sq.cd8[[ct1]][brca,tp] <- summary(lm1)$r.squared
+    }
+  }
+
+  df.cd8 <- reshape2::melt(p.vals.cd8[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.cd8[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    mutate(x=xys[[ct]]$x,y=xys[[ct]]$y)
+  
+  df.cd8.3 <- reshape2::melt(p.vals.cd8[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.cd8[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    filter(TimePoint %in% c("BX3")) %>%
+    mutate(x=xys.3[[ct]]$x,y=xys.3[[ct]]$y)
+  
+  p <- ggplot(n.cts5,aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+    scale_y_log10() +
+    geom_point(aes(shape=Subtype)) +
+    scale_color_manual(values=brca.mids) +
+    facet_wrap(~TimePoint) +
+    labs(
+      title = pretty_titles[[ct]],
+      x = "Frequency (out of all cells)",
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method="lm",se=FALSE) +
+    geom_text_repel() +
+    geom_text(data=df.cd8,aes(x=x,y=y,label=txt),size=5,color=1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval.pdf")),width=12,height=4)
+  print(p)
+  dev.off()
+  if(ct == "all"){
+    p <- ggplot(n.cts5 %>% filter(TimePoint == "BX3"),aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+      scale_y_log10() +
+      geom_point(aes(shape=Subtype)) +
+      scale_color_manual(values=brca.mids) +
+      labs(
+        title = pretty_titles[[ct]],
+        x = "Frequency (out of all cells)",
+        y = "PFS (days)"
+      ) +
+      geom_smooth(method="lm",se=FALSE) +
+      geom_text_repel() +
+      geom_text(data=df.cd8.3,aes(x=x,y=y,label=txt),size=5,color=1) +
+      theme_bw() + 
+      theme(legend.position="none")
+  
+    pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval_bx3.pdf")),width=4,height=4)
+    print(p)
+    dev.off()
+  }
+}
+```
+
+#### CD4T
+```{r}
+cd4.stat <- do.call(rbind,cd4.ts)
+cd4.stat <- as.data.frame(cd4.stat) %>% 
+  rownames_to_column("id") %>%
+  mutate(PD1_all=PD1 + PD1_GrB,
+         GrB_all=GrB + PD1_GrB)
+colnames(cd4.stat)[-1] <- paste0("CD4T_",colnames(cd4.stat)[-1])
+
+cts7.1 <- table(cell_types(cs7)) %>%
+  as.data.frame() %>%
+  spread(cell_types,Freq) %>%
+  rename(id="sample") %>%
+  left_join(cd4.stat,by="id")
+
+n.cts7 <- t(apply(cts7.1[-1],1,function(x)x/sum(x[2:12]))) %>% 
+  as.data.frame() %>%
+  mutate(id=cts7.1$id) %>%
+  relocate(id) %>%
+  left_join(pd7,by="id") %>%
+  rename(CD4T_all="CD4T")
+
+t.subs <- c("all","PD1_all","GrB_all","PD1_GrB","PD1","GrB","dn")  
+
+r.sq.cd4 <- p.vals.cd4 <- list()
+xys <- list(
+  all = list(x=c(0.2,0.2,0.2,0.2,0.2,0.2),y=c(600,75,600,75,600,75)),
+  PD1_all = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB_all = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  PD1_GrB = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  PD1 = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  dn = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75))
+)
+  
+pretty_titles <- c(
+  all = "all CD4T cells",
+  PD1_all = "PD-1+ CD4T cells",
+  GrB_all = "GrB+ CD4T cells",
+  PD1_GrB = "PD-1+/GrB+ CD4T cells",
+  PD1 = "PD-1+/GrB- CD4T cells",
+  GrB = "PD-1-/GrB+ CD4T cells",
+  dn = "PD-1-/GrB- CD4T cells"
+)
+
+for(ct in t.subs){
+  ct1 <- paste0("CD4T_",ct)
+  r.sq.cd4[[ct1]] <- p.vals.cd4[[ct1]] <- p.vals
+  for(brca in c("MUT","WT")){
+    for(tp in c("BS","BX2","BX3")){
+      x <- n.cts7 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(!!sym(ct1))
+      y <- n.cts7 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(PFS_days)
+      lm1 <- try(lm(log(y) ~ x))
+        
+      if(nrow(summary(lm1)$coefficients)==2){
+        p.vals.cd4[[ct1]][brca,tp] <- summary(lm1)$coefficients[2,4]
+        r.sq.cd4[[ct1]][brca,tp] <- summary(lm1)$r.squared
+      }else{
+        p.vals.cd4[[ct1]][brca,tp] <- NA
+        r.sq.cd4[[ct1]][brca,tp] <- NA
+      }
+    }
+  }
+
+  df.cd4 <- reshape2::melt(p.vals.cd4[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.cd4[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    mutate(x=xys[[ct]]$x,y=xys[[ct]]$y)
+    
+  df.cd4.3 <- reshape2::melt(p.vals.cd4[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.cd4[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    filter(TimePoint %in% c("BX3")) %>%
+    mutate(x=xys.3[[ct]]$x,y=xys.3[[ct]]$y)
+
+  p <- ggplot(n.cts7,aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+    scale_y_log10() +
+    geom_point(aes(shape=Subtype)) +
+    scale_color_manual(values=brca.mids) +
+    facet_wrap(~TimePoint) +
+    labs(
+      title = pretty_titles[[ct]],
+      x = "Frequency (out of all cells)",
+      y = "PFS (days)"
+    ) +
+    geom_smooth(method="lm",se=FALSE) +
+    geom_text_repel() +
+    geom_text(data=df.cd4,aes(x=x,y=y,label=txt),size=5,color=1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval.pdf")),width=12,height=4)
+  print(p)
+  dev.off()
+  if(ct == "all"){
+    p <- ggplot(n.cts7 %>% filter(TimePoint == "BX3"),aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+      scale_y_log10() +
+      geom_point(aes(shape=Subtype)) +
+      scale_color_manual(values=brca.mids) +
+      labs(
+        title = pretty_titles[[ct]],
+        x = "Frequency (out of all cells)",
+        y = "PFS (days)"
+      ) +
+      geom_smooth(method="lm",se=FALSE) +
+      geom_text_repel() +
+      geom_text(data=df.cd4.3,aes(x=x,y=y,label=txt),size=5,color=1) +
+      theme_bw() + 
+      theme(legend.position="none")
+  
+    pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval_bx3.pdf")),width=4,height=4)
+    print(p)
+    dev.off()
+  }
+}
+```
+
+#### T_other and their subtypes
+```{r}
+t_other.stat <- do.call(rbind,t_other.ts)
+t_other.stat <- as.data.frame(t_other.stat) %>% 
+  rownames_to_column("id") %>%
+  mutate(PD1_all=PD1 + PD1_GrB,
+         GrB_all=GrB + PD1_GrB)
+colnames(t_other.stat)[-1] <- paste0("T_other_",colnames(t_other.stat)[-1])
+
+cts5.1 <- table(cell_types(cs5)) %>%
+  as.data.frame() %>%
+  spread(cell_types,Freq) %>%
+  rename(id="sample") %>%
+  select(-T_other) %>%
+  left_join(t_other.stat,by="id")
+
+n.cts5 <- t(apply(cts5.1[-1],1,function(x)x/sum(x))) %>% 
+  as.data.frame() %>%
+  mutate(id=cts5.1$id) %>%
+  relocate(id) %>%
+  left_join(pd5,by="id")
+
+t.subs <- c("PD1_all","GrB_all","PD1_GrB","PD1","GrB","dn")  
+
+r.sq.t_other <- p.vals.t_other <- list()
+xys <- list(
+  PD1_all = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB_all = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  PD1_GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  PD1 = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  dn = list(x=c(0.075,0.075,0.075,0.075,0.075,0.075),y=c(600,75,600,75,600,75))
+)
+
+pretty_titles <- c(
+  PD1_all = "PD-1+ T_other cells",
+  GrB_all = "GrB+ T_other cells",
+  PD1_GrB = "PD-1+/GrB+ T_other cells",
+  PD1 = "PD-1+/GrB- T_other cells",
+  GrB = "PD-1-/GrB+ T_other cells",
+  dn = "PD-1-/GrB- T_other cells"
+)
+  
+for(ct in t.subs){
+  ct1 <- paste0("T_other_",ct)
+  r.sq.t_other[[ct1]] <- p.vals.t_other[[ct1]] <- p.vals
+  for(brca in c("MUT","WT")){
+    for(tp in c("BS","BX2","BX3")){
+      x <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(!!sym(ct1))
+      y <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(PFS_days)
+      lm1 <- lm(log(y) ~ x)
+      
+      p.vals.t_other[[ct1]][brca,tp] <- summary(lm1)$coefficients[2,4]
+      r.sq.t_other[[ct1]][brca,tp] <- summary(lm1)$r.squared
+    }
+  }
+
+  df.t_other <- reshape2::melt(p.vals.t_other[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.t_other[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    mutate(x=xys[[ct]]$x,y=xys[[ct]]$y)
+  
+  p <- ggplot(n.cts5,aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+    scale_y_log10() +
+    geom_point(aes(shape=Subtype)) +
+    scale_color_manual(values=brca.mids) +
+    facet_wrap(~TimePoint) +
+    labs(title=ct1,x="Frequency (out of all cells)",y="PFS (days)") +
+    geom_smooth(method="lm",se=FALSE) +
+    geom_text_repel() +
+    geom_text(data=df.t_other,aes(x=x,y=y,label=txt),size=5,color=1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval.pdf")),width=12,height=4)
+  print(p)
+  dev.off()
+}
+```
+
+#### T_all and their subtypes
+```{r}
+t_all.stat <- (cd8.stat %>% arrange(id) %>% select(-id) +
+               non_cd8t.stat %>% arrange(id) %>% select(-id)) %>%
+  cbind(id = sort(cd8.stat$id)) %>%
+  relocate(id)
+colnames(t_all.stat)[-1] <- paste0("T_all_",t.subs[c(5,3,4,6,1,2)])
+
+cts5 <- table(cell_types(cs5)) %>%
+  as.data.frame() %>%
+  spread(cell_types,Freq) %>%
+  rename(id="sample") %>%
+  select(-c(CD8T,T_other)) %>%
+  left_join(t_all.stat,by="id")
+
+n.cts5 <- t(apply(cts5[-1],1,function(x)x/sum(x))) %>% 
+  as.data.frame() %>%
+  mutate(id=cts5$id) %>%
+  relocate(id) %>%
+  left_join(pd5,by="id")
+
+t.subs <- c("PD1_all","GrB_all","PD1_GrB","PD1","GrB","dn")  
+
+r.sq.t_all <- p.vals.t_all <- list()
+xys <- list(
+  PD1_all = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB_all = list(x=c(0.01,0.01,0.01,0.01,0.01,0.01),y=c(600,75,600,75,600,75)),
+  PD1_GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  PD1 = list(x=c(0.1,0.1,0.1,0.1,0.1,0.1),y=c(600,75,600,75,600,75)),
+  GrB = list(x=c(0.0025,0.0025,0.0025,0.0025,0.0025,0.0025),y=c(600,75,600,75,600,75)),
+  dn = list(x=c(0.075,0.075,0.075,0.075,0.075,0.075),y=c(600,75,600,75,600,75))
+)
+  
+for(ct in t.subs){
+  ct1 <- paste0("T_all_",ct)
+  r.sq.t_all[[ct1]] <- p.vals.t_all[[ct1]] <- p.vals
+  for(brca in c("MUT","WT")){
+    for(tp in c("BS","BX2","BX3")){
+      x <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(!!sym(ct1))
+      y <- n.cts5 %>% filter(BRCA==brca,TimePoint==tp) %>% pull(PFS_days)
+      lm1 <- lm(log(y) ~ x)
+      
+      p.vals.t_all[[ct1]][brca,tp] <- summary(lm1)$coefficients[2,4]
+      r.sq.t_all[[ct1]][brca,tp] <- summary(lm1)$r.squared
+    }
+  }
+
+  df.t_all <- reshape2::melt(p.vals.t_all[[ct1]], c("BRCA", "TimePoint"), value.name = "p-val") %>%
+    left_join(reshape2::melt(r.sq.t_all[[ct1]], c("BRCA", "TimePoint"), value.name = "r-sq"),by=c("BRCA","TimePoint")) %>%
+    mutate(txt=paste0("p=",round(`p-val`,3),"\nR2=",round(`r-sq`,3))) %>%
+    mutate(x=xys[[ct]]$x,y=xys[[ct]]$y)
+  
+  p <- ggplot(n.cts5,aes(x=!!sym(ct1),y=PFS_days,color=BRCA,label=Patient.ID)) +
+    scale_y_log10() +
+    geom_point(aes(shape=Subtype)) +
+    scale_color_manual(values=brca.mids) +
+    facet_wrap(~TimePoint) +
+    labs(title=ct1,x="Frequency (out of all cells)",y="PFS (days)") +
+    geom_smooth(method="lm",se=FALSE) +
+    geom_text_repel() +
+    geom_text(data=df.t_all,aes(x=x,y=y,label=txt),size=5,color=1) +
+    theme_bw()
+
+  pdf(file.path(cycif_fig_dir, "marker_frequency", "pfs_by_frequency", paste0(ct1,"_pfs_w_pval.pdf")),width=12,height=4)
+  print(p)
+  dev.off()
+}
+```
+
+
+All UMAP-based analysis (All Cells, Tumor Cells, Macrophages, and the Save UMAP
+Objects/Coordinates step) is in `4_cycif_umap_analysis.Rmd`, which loads
+`cs7`/`pd7`/`cts7`/`ct.cols7`/`pt.cols` directly from `cs7.rds` (the same checkpoint file
+this notebook uses) rather than depending on an export from here.

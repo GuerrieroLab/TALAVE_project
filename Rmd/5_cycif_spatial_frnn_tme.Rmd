@@ -1,0 +1,774 @@
+---
+title: "TALAVE CyCIF analysis: TME clustering + figure generation (part 2 of 2)"
+author: "Kenichi Shimada"
+---
+
+# TALAVE CyCIF analysis
+
+Loads the spatial FRNN checkpoint, generates the [EDF2C] cell-type hierarchy and [Fig 2C]
+tumor cell density figures, and runs TME-level Leiden clustering with its UMAP and
+cluster-frequency outputs.
+
+**Required run order: `3` -> `4` -> `5` (this notebook) -> `6`.**
+This notebook's own TME clustering has no dependency on `3` or `4` -- only the final export
+step does, where `cluster_mac` (from `4`'s output) is merged onto this notebook's
+`cluster_tme`-populated `frnn7.cmb` to produce the combined checkpoint `6` needs.
+
+## ---- Initial Setup ----
+
+### Load Configuration
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+if (!requireNamespace("CycifAnalyzeR", quietly = TRUE)) {
+  remotes::install_github("<org>/CycifAnalyzeR")
+}
+library(CycifAnalyzeR)
+source(file.path(root_dir,"functions","plotting.R"))
+source(file.path(source_dir, "plotting_cycif.R"))
+source(file.path(source_dir, "analysis_cycif.R"))
+source(file.path(source_dir, "io.R"))
+
+for (d in c("cell_type/hierarchy")) {
+  dir.create(file.path(cycif_fig_dir, d), recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+### Load Batch-Corrected Objects
+
+```{r}
+cs5 <- readRDS(file.path(cycif_obj_dir, "cs5.rds"))
+cs7 <- readRDS(file.path(cycif_obj_dir, "cs7.rds"))
+load(file.path(cycif_obj_dir, "cycif_spatial_frnn_input_data.rda")) # frnn7.cmb, frnn7.exp, frnn7.rcn, is.sele.7
+
+pd5 <- pData(cs5)
+pd7 <- pData(cs7)
+cst7.abs <- colnames(cs7@cell_types$default@cell_state_def)
+uniq.cts <- get_cycif_uniq_cts()
+pt.cols <- load_pt_colors()
+
+load(file.path(cycif_obj_dir, "cycif5_neighborhood_profiles.rda")) # frnn5.rcn, frnn5.exp
+frnn5.tum.n <- rowSums(frnn5.rcn[,1:2])
+```
+
+## ---- Cell-Type Hierarchy ----
+
+### [EDF2C] `cs5`/`cs7` Cell-Type Hierarchy
+
+```{r}
+cycif_cell_types <- load_cycif_cell_type_definitions()
+ctype.5 <- cycif_cell_types$ctype.5
+ctype.7 <- cycif_cell_types$ctype.7
+
+pdf(file.path(cycif_fig_dir, "cell_type", "hierarchy", "ab_graph_cyc5.pdf"),width=7,height=7)
+par(mar=c(0,0,3,0))
+CellTypeGraph(ctype.5,plot=T,main='Cycles 1-5')
+dev.off()
+
+pdf(file.path(cycif_fig_dir, "cell_type", "hierarchy", "ab_graph_cyc7.pdf"),width=7,height=7)
+par(mar=c(0,0,3,0))
+CellTypeGraph(ctype.7,plot=T,main='Cycles 1-7')
+dev.off()
+```
+
+## ---- Tumor Cell Density Overview ----
+
+### [Fig 2C] Tumor Cell Density by BRCA and Time Point
+
+```{r}
+smpls.x5 <- cell_types(cs5) %>% filter(!is.na(cell_types)) %>% pull(sample)
+dfx5 <- data.frame(n=frnn5.tum.n,id=smpls.x5) %>%
+  filter(n>0) %>%
+  group_by(id) %>%
+  summarize(n=median(n)) %>%
+  left_join(pd5 %>% select(id,Patient.ID,BRCA,TimePoint,BOR),by="id") %>%
+  mutate(bt3 = paste0(BRCA,"_",TimePoint)) %>%
+  mutate(bt3 = factor(bt3,levels=c("MUT_BS","MUT_BX2","MUT_BX3","WT_BS","WT_BX2","WT_BX3"))) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn,as.character(Patient.ID),"")
+  ) %>%
+  ungroup() %>%
+  arrange(bt3)
+
+p5 <- plot_ct(dfx5, y_var = "n", y_label = "Tumor cell density", 
+        title = "Tumor cell density around tumor cells",
+        pt.cols = pt.cols)
+
+pdf(file.path(cycif_fig_dir, "spatial", "tumor_density", "n_tumor_cells_density_cs5.pdf"),width=5,height=7)
+print(p5$plot)
+dev.off()
+
+```
+
+
+## ---- TME UMAP and Cluster Characterization ----
+
+### Build TME UMAP
+```{r}
+mat <- as.matrix(frnn7.cmb[, 3:13])
+n <- rowSums(mat)
+
+if(1){
+  set.seed(1)
+  mat.jittered <- mat + matrix(rnorm(length(mat), mean = 0, sd = 1e-6), nrow = nrow(mat))
+  mat_log <- log1p(mat.jittered)  # log(x + 1) to handle zeros safely
+  mat_row_norm <- sweep(mat_log, 1, rowSums(mat_log), "/")
+}else{
+  mat_freq <- t(apply(mat,1,function(x)x/sum(x)))
+  mat.jittered <- mat_freq + matrix(rnorm(length(mat), mean = 0, sd = 1e-6), nrow = nrow(mat))
+  mat_row_norm <- mat_log <- log1p(mat.jittered)
+}
+
+is.sele.tme <- n>= 10 & is.sele.7
+
+mat.exp <- frnn7.exp
+mat.cmb.all <- cbind(mat_row_norm, mat.exp %>% select(-1))
+mat.cmb <- mat.cmb.all[n >= 10 & is.sele.7, ]  # Filter rows with n >= 10
+
+```
+
+```{r}
+if(1){
+  mat.cmb.imputed20 <- knn_impute_dt(mat.cmb, k = 20, weighted = TRUE, fallback = "median")
+}else{
+  mat.cmb.imputed50 <- knn_impute_dt(mat.cmb, k = 50, weighted = TRUE,
+                                     rebuild_per_col = TRUE, fallback = "median")
+}
+mat.1 <- as.data.frame(mat.cmb.imputed20)
+```
+
+#### Compute Embedding
+```{r}
+set.seed(12345)
+k <- 50
+umap <- uwot::umap(mat.1,scale=TRUE,n_neighbors = k, verbose=TRUE)
+
+colnames(umap) <- c("umap_x","umap_y")
+
+frnn7.cmb <- frnn7.cmb %>% mutate(.rid = dplyr::row_number())
+
+dt.tme.1 <- frnn7.cmb %>% 
+  filter(n>=10 & is.sele.7) %>% 
+  cbind(umap) %>%
+  left_join(pd7 %>% 
+              rename(lspid="sample") %>%
+              mutate(batch = case_when(
+                substr(lspid, 1, 2) == "13" ~ 1,
+                substr(lspid, 1, 2) == "14" ~ 2,
+                substr(lspid, 1, 2) == "22" ~ 3,
+                TRUE ~ NA_real_
+              ),
+              batch=factor(as.numeric(batch))) %>%
+              select(id,batch,bt3),by=c("sample" = "id"))
+
+idx1 <- rowSums(mat.cmb[,1:2])>0.8
+dt.tme.1[names(mat.cmb)] <- mat.cmb.imputed20
+dt.tme.1 <- dt.tme.1 %>% mutate(idx=idx1)
+```
+
+### [Fig 6B, 6L, EDF9A, EDF9B, EDF9C, EDF9D] TME UMAP Outputs
+
+#### Metadata overlays (tumor fraction, sample, BRCA/timepoint)
+```{r}
+p1_leg <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = idx), point_size = 0.8) +
+  ggtitle("Tumor freq > 0.8") +   
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "black"),
+                     name = "Tumor freq > 0.8")
+p1_main <- p1_leg  + theme(legend.position = "none")
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "metadata", paste0("umap__tme_tumor_ge80.png")),
+   p1_main, width = 7, height = 7, units = "in", dpi = 300)
+save_legend_pdf(p1_leg, file.path(cycif_fig_dir, "umap", "tme", "metadata", paste0("umap__tme_tumor_ge80_legend.pdf")),
+   width = 4, height = 8)
+```
+
+```{r}
+p2_full <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = sample), point_size = 0.8) +
+  ggtitle("Samples")
+p2 <- p2_full + theme(legend.position = "none")
+save_legend_pdf(p2_full, file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_smpls_legend.pdf"), width = 4, height = 8)  
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_sample.png"), p2, width = 7, height = 7, units ="in", dpi = 300)
+
+p3_full <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = bt3), point_size = 0.8) +
+  scale_color_brewer(palette = "Set3") +
+  ggtitle("BRCA + TimePoint")
+p3 <- p3_full + theme(legend.position = "none")
+save_legend_pdf(p3_full, file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_bt3_legend.pdf"), width = 4, height = 6)  
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_bt3.png"), p3, width = 7, height = 7, units = "in", dpi = 300)
+
+p3_full <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = TimePoint), point_size = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("TimePoint, stratified by BRCA")
+p3 <- p3_full + theme(legend.position = "none")
+p3 <- p3 + facet_wrap(~BRCA) + theme(strip.text = element_text(size = 36))
+save_legend_pdf(p3_full, file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_bt3_wide_legend.pdf"), width = 4, height = 6)
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_bt3_wide.png"), p3, width = 14, height = 7, units = "in", dpi = 300)
+```
+
+#### Marker expression, per antibody
+```{r}
+for(ab1 in cst7.abs){
+  dtt <- dt.tme.1 %>%
+    select(umap_x, umap_y, !!sym(paste0(ab1, ".log"))) %>%
+    rename(ab = paste0(ab1, ".log")) %>%
+    mutate(ab = pmin(pmax(ab, quantile(ab, 0.05)), quantile(ab, 0.95))) %>%
+    mutate(
+      ab_raw = ab,
+      density = ab_raw
+    )
+    
+  coords <- as.matrix(dtt[, c("umap_x", "umap_y")])
+  
+  knn <- get.knn(coords, k = 50)
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  dtt <- dtt %>%
+    mutate(density = apply(knn_indices, 1, function(idx){
+      mean(dtt$density[idx], na.rm = TRUE)
+    })) %>%
+    mutate(density = {
+        q <- quantile(density, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(density, q[1]), q[2])
+    })
+
+  p <- ggplot(dtt,aes(x=umap_x,y=umap_y,col=density)) + 
+    geom_point(size=0.8) +
+    coord_fixed(ratio=1) +
+    viridis::scale_color_viridis(guide = "none") +
+    theme_minimal() +
+    ggtitle(ab1) +
+    umap_styling_1()
+
+  if (ab1 == cst7.abs[1]) {
+    p_full <- ggplot(dtt, aes(x = umap_x, y = umap_y, col = ab)) +
+      geom_point(size = 0.1) +
+      coord_fixed(ratio = 1) +
+      viridis::scale_color_viridis(name = ab1) +
+      theme_minimal() +
+      ggtitle(ab1) +
+      umap_styling_1()
+
+    save_legend_pdf(p_full,
+      file.path(cycif_fig_dir, "umap", "tme", "ab", paste0("legend__", ab1, ".pdf")),
+      width = 4, height = 6
+    )
+  }
+
+  ggsave(file.path(cycif_fig_dir, "umap", "tme", "ab", paste0("umap__",ab1,".png")),p, width = 7, height = 7, units = "in", dpi = 300)  
+}
+```
+
+#### Cell-type density, per cell type
+```{r}
+for(ct1 in uniq.cts){
+  dtt <- dt.tme.1 %>%
+    select(umap_x,umap_y,!!sym(ct1)) %>%
+    rename(ct=ct1) %>%
+    mutate(
+      ct_raw = ct,
+      density = ct_raw
+    )
+
+  coords <- as.matrix(dtt[, c("umap_x", "umap_y")])
+  
+  knn <- get.knn(coords, k = 50)
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  dtt <- dtt %>%
+    mutate(density = apply(knn_indices, 1, function(idx){
+      mean(dtt$density[idx], na.rm = TRUE)
+    })) %>%
+    mutate(density = {
+        q <- quantile(density, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(density, q[1]), q[2])
+    })
+
+  p <- ggplot(dtt,aes(x=umap_x,y=umap_y,col=density)) + 
+    geom_point(size=0.8) +
+    coord_fixed(ratio=1) +
+    scale_color_distiller(palette = "YlGnBu", direction = 1, name = "Local Pos %", guide = "none") + 
+    theme_minimal() +
+    ggtitle(ct1) +
+    umap_styling_1() +
+    theme(legend.position="none")
+
+  ggsave(file.path(cycif_fig_dir, "umap", "tme", "ct", paste0("umap__ct_",ct1,".png")),p, width = 7, height = 7, units = "in", dpi = 300)  
+}
+
+```
+
+#### Marker co-expression heatmap
+```{r}
+expr_mat <- dt.tme.1 %>%
+  select(!!!syms(paste0(cst7.abs, ".log"))) %>%
+  select(-GrB.log)
+
+coex_tme <- cor(expr_mat, method = "spearman", use = "pairwise.complete.obs")
+coex_tme0 <- coex_tme
+
+mat_sig_04 <- coex_tme0 > 0.4
+mat_sig_05 <- coex_tme0 > 0.5
+
+diag(mat_sig_04) <- FALSE
+diag(mat_sig_05) <- FALSE
+
+cap <- 1
+col_fun <- circlize::colorRamp2(
+  c(-cap, 0, cap),
+  c("#2166ac", "white", "#b2182b")
+)
+
+ht <- Heatmap(
+  coex_tme,
+  name = "Spearman\nrho",
+  col = col_fun,
+  na_col = "white",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  rect_gp = gpar(col = NA),
+  column_title = "Co-expression of cell state markers (TME)",
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    
+    if (mat_sig_05[i, j]) {
+      grid.rect(
+        x = x, y = y, width = w, height = h,
+        gp = gpar(fill = NA, col = "black", lwd = 1.5)
+      )
+      
+    } else if (mat_sig_04[i, j]) {
+      grid.rect(
+        x = x, y = y, width = w, height = h,
+        gp = gpar(fill = NA, col = "grey40", lwd = 1.2)
+      )
+    }
+  }
+)
+  
+lgd_border <- Legend(
+  title = "Correlation",
+  labels = c("rho > 0.5", "0.4 < rho <= 0.5"),
+  type = "lines",
+  legend_gp = gpar(col = c("black", "grey40"), lwd = 2),
+  direction = "vertical"
+)
+
+pdf(file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "coex_tme_heatmap.pdf"),
+    width = 7, height = 7)
+
+ComplexHeatmap::draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE,
+  heatmap_legend_list = list(lgd_border)
+)
+
+dev.off()
+
+```
+
+### Characterize TME Clusters
+
+
+```{r}
+k <- 50
+mat.cmb_scaled <- scale(mat.1)
+knn <- get.knn(mat.cmb_scaled,k = k)
+
+edges <- do.call(rbind, lapply(1:nrow(knn$nn.index), function(i) {
+  cbind(i, knn$nn.index[i, ])
+}))
+
+g <- graph_from_edgelist(edges, directed = FALSE)
+g <- igraph::simplify(g)
+
+leiden_res <- leiden_find_partition(g, resolution_parameter = 2e-3,seed=12345)
+cluster_labels <- membership(leiden_res)
+lc <- length(table(cluster_labels))
+lc
+```
+
+```{r}
+good_hues <- c(seq(0, 40, length.out = 5),
+               seq(80, 160, length.out = 5),
+               seq(200, 360, length.out = 7))
+
+custom_colors <- hcl(h = good_hues, c = 100, l = 65)
+spectral_colors <- colorRampPalette(brewer.pal(11, "Spectral"))(lc)
+set.seed(7)
+custom_colors <- sample(spectral_colors)[c(1,2,3,5,6,4,7,10,9,8,11,14,13,12,16,15,17)]
+ct.cols17 <- setNames(custom_colors, paste0("TME_", seq_along(custom_colors)))
+```
+
+### [Fig 6A, 6C] TME Cluster Composition and Expression
+
+#### Labeled cluster UMAP
+```{r}
+dt.tme.1 <- dt.tme.1 %>%
+  mutate(cluster = factor(paste0("TME_", cluster_labels),levels=paste0("TME_",seq(lc))))
+
+frnn7.cmb$cluster <- NA
+frnn7.cmb$cluster[n >= 10 & is.sele.7] <- as.character(dt.tme.1$cluster)
+frnn7.cmb <- frnn7.cmb %>%
+  mutate(cluster = factor(cluster,levels=paste0("TME_",1:17)))
+
+label_coords <- dt.tme.1 %>%
+  group_by(cluster) %>%
+  summarise(
+    x = median(umap_x, na.rm = TRUE),
+    y = median(umap_y, na.rm = TRUE)
+  ) %>%
+  mutate(text = ifelse(!cluster %in% c("TME_4","TME_11","TME_12","TME_16"),
+                       as.numeric(sub("TME_","",cluster)),
+                       "")) %>%
+  ungroup()  %>%
+  arrange(text)
+
+p_full <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = cluster)) +
+  scale_color_manual(values = ct.cols17) +
+  umap_styling() +
+  geom_text(data = label_coords, aes(x = x, y = y, label = text),
+            color = "grey30", size = 15) +
+  plot_annotation(
+    title = "TME clusters",
+    theme = theme(
+      plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+      plot.background = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank()
+    )
+  ) 
+
+p_main <- p_full + theme(legend.position = "none")
+
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "ct", "umap_cts_cluster-new.png"),
+   p_main, width = 7, height = 7, units = "in", dpi = 300)
+```
+
+#### UMAP highlighting TME_11/TME_12/TME_16
+```{r}
+dt.tme.1s <- dt.tme.1 %>%
+  mutate(cluster = if_else(cluster %in% c("TME_11", "TME_12", "TME_16"),
+                           cluster,
+                           "others")) %>%
+  mutate(cluster = factor(cluster, levels = c("TME_16","TME_12","TME_11","others"))) %>%
+  arrange(desc(cluster))
+p_full1 <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = cluster)) + 
+  scale_color_manual(values = ct.cols17) +
+  umap_styling() +
+  plot_annotation(
+    title = "TME clusters",
+    theme = theme(
+      plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+      plot.background = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank()
+    )
+  ) 
+p_main1 <- p_full1 + theme(legend.position = "none")
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "ct", "umap_cts_cluster-new_nolabel_1.png"),
+   p_main1, width = 7, height = 7, units = "in", dpi = 300)  
+```
+
+#### Cell-type composition heatmap by cluster
+```{r}
+dt.ct <- dt.tme.1 %>%
+  select(3:13,cluster)
+
+long_counts <- dt.ct %>%
+  pivot_longer(-cluster, names_to = "celltype", values_to = "count") %>%
+  mutate(celltype = factor(celltype, levels = uniq.cts))
+
+clusters <- levels(long_counts$cluster)
+celltypes <- levels(long_counts$celltype)
+
+pvals_df <- long_counts %>%
+  group_by(celltype) %>%
+  group_modify(~{
+    df <- .x
+    tibble(
+      cluster = clusters,
+      pval = vapply(clusters, function(cl) {
+        in_vals  <- df$count[df$cluster == cl]
+        out_vals <- df$count[df$cluster != cl]
+        if (length(in_vals) == 0 || length(out_vals) == 0) return(NA_real_)
+        suppressWarnings(
+          wilcox.test(in_vals, out_vals, alternative = "greater")$p.value
+        )
+      }, numeric(1))
+    )
+  }) %>%
+  ungroup()
+
+pvals_df <- pvals_df %>%
+  group_by(celltype) %>%
+  mutate(padj = p.adjust(pval, method = "BH")) %>%
+  ungroup()
+
+p_mat <- pvals_df %>%
+  select(cluster, celltype, pval) %>%
+  pivot_wider(names_from = cluster, values_from = pval) %>%
+  column_to_rownames("celltype") %>%
+  as.matrix()
+p_mat <- p_mat[uniq.cts,paste0("TME_",seq(length(clusters)))]
+
+sig_labels <- ifelse(p_mat < 1e-100, "*", "")
+
+long_counts <- dt.ct %>%
+  pivot_longer(-cluster, names_to = "celltype", values_to = "count")
+
+mat <- long_counts %>%
+  group_by(cluster, celltype) %>%
+  summarise(count = mean(count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = cluster,
+    values_from = count,
+    values_fill = list(count = 0)
+  ) %>%
+  arrange(celltype) %>%
+  column_to_rownames("celltype") %>%
+  as.matrix()
+mat <- mat[uniq.cts,paste0("TME_",seq(length(clusters)))]
+
+mat_rownorm <- t(apply(mat, 1, function(x) {
+  if (max(x) == min(x)) {
+    rep(0.5, length(x))
+  } else {
+    (x / max(x))
+  }
+}))
+
+col_fun <- colorRamp2(
+  seq(0, 1, length = 6),
+  brewer.pal(6, "YlGnBu")
+)
+
+p <- Heatmap(
+  mat_rownorm, 
+  name = "Rel. freq (row-norm)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  cell_fun = function(j, i, x, y, w, h, fill){
+    lab <- sig_labels[i, j]
+    if (!is.na(lab) && nzchar(lab)) {
+      grid.text(lab, x, y, gp = gpar(fontsize = 12, fontface = "bold"))
+    }
+  },
+  heatmap_legend_param = list(
+    title = "Frequency\n(row-norm)",
+    legend_direction = "vertical"
+  )
+) %>%
+  ComplexHeatmap::draw(heatmap_legend_side = "right")
+
+pdf(file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "mean_ct_freq_by_cluster_v2.pdf"),width=8,height=5)
+print(p)
+dev.off()
+```
+
+#### Marker expression heatmap by cluster
+```{r}
+cst7.abs.1 <- rev(c("PD1","PDL1","cCaspase3","gH2AX","pTBK1","BCLXL","MCL1","pAKT","pERK"))
+
+dt.ab <- dt.tme.1 %>% select(15:23,"cluster") 
+
+long_counts <- dt.ab %>%
+  pivot_longer(-cluster, names_to = "protein", values_to = "exp")
+
+clusters <- levels(dt.ab$cluster)
+
+pvals_df <- long_counts %>%
+  group_by(protein) %>%
+  group_modify(~{
+    df <- .x
+    tibble(
+      cluster = clusters,
+      pval = vapply(clusters, function(cl) {
+        in_vals  <- df$exp[df$cluster == cl]
+        out_vals <- df$exp[df$cluster != cl]
+        if (length(in_vals) == 0 || length(out_vals) == 0) return(NA_real_)
+        suppressWarnings(
+          wilcox.test(in_vals, out_vals, alternative = "greater")$p.value
+        )
+      }, numeric(1))
+    )
+  }) %>%
+  ungroup()
+
+pvals_df <- pvals_df %>%
+  group_by(protein) %>%
+  mutate(padj = p.adjust(pval, method = "BH")) %>%
+  ungroup()
+
+p_mat <- pvals_df %>%
+  select(cluster, protein, pval) %>%
+  pivot_wider(names_from = cluster, values_from = pval) %>%
+  column_to_rownames("protein") %>%
+  as.matrix()
+
+p_mat <- p_mat[cst7.abs.1,paste0("TME_",seq(length(clusters)))]
+
+sig_labels <- ifelse(p_mat < 1e-75, "*", "")
+
+mat <- long_counts %>%
+  group_by(cluster, protein) %>%
+  summarise(exp = mean(exp, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = cluster,
+    values_from = exp,
+    values_fill = list(exp = 0)
+  ) %>%
+  column_to_rownames("protein") %>%
+  as.matrix()
+mat <- mat[cst7.abs.1,]
+
+mat_rownorm <- t(apply(mat, 1, function(x) {
+  tmp <- scale(x,center=TRUE,scale=TRUE)
+  tmp <- pmin(pmax(tmp, -3), 3)
+  return(tmp)
+}))
+colnames(mat_rownorm) <- colnames(mat)
+
+col_fun <- colorRamp2(
+  seq(-3, 3, length = 9),
+  rev(brewer.pal(11, "RdBu")[2:10])
+)
+
+p <- Heatmap(
+  mat_rownorm,
+  name = "Rel. freq (row-norm)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  cell_fun = function(j, i, x, y, w, h, fill){
+    lab <- sig_labels[i, j]
+    if (!is.na(lab) && nzchar(lab)) {
+      grid.text(lab, x, y, gp = gpar(fontsize = 12, fontface = "bold"))
+    }
+  },
+  heatmap_legend_param = list(
+    title = "Expression\n(row-scaled)",
+    legend_direction = "vertical"
+  )
+) %>%
+  ComplexHeatmap::draw(heatmap_legend_side = "right")
+
+pdf(file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "mean_ab_freq_by_cluster_v2.pdf"),width=8,height=5)
+print(p)
+dev.off()
+```
+
+### [Fig 6D, 6E, 6H, EDF9F] TME Cluster Frequency by BRCA and Time Point
+
+Computes each sample's relative frequency of cells falling into each of the 17 TME clusters,
+then plots each cluster's frequency across BRCA x TimePoint groups via `plot_ct()` (same LMER
+framework used throughout this pipeline).
+```{r}
+dt.tme.means <- dt.tme.1 %>%
+  mutate(sample = factor(sample)) %>%
+  select(cluster,sample) %>%
+  group_by(cluster,sample) %>%
+  summarise(n=n(),.groups = "drop") %>%
+  complete(cluster, sample, fill = list(n = 0)) %>%
+  left_join(pd7 %>% select(id,TimePoint,BRCA,bt3,BOR,Patient.ID),
+            by=c("sample"="id")) %>%
+  group_by(sample) %>%
+  mutate(rel_freq = n / sum(n)) %>%
+  ungroup()
+
+if(!dir.exists(file.path(cycif_fig_dir, "umap", "tme", "cluster_freq"))){
+  dir.create(file.path(cycif_fig_dir, "umap", "tme", "cluster_freq"),recursive=TRUE)
+}
+
+uniq.tmes <- paste0("TME_",1:17)
+for(ut in uniq.tmes){
+  tmp <- dt.tme.means %>% filter(cluster == ut)
+  p <- plot_ct(tmp, y_var = "rel_freq", y_label = "Relative frequency",
+    title = paste0(ut, " frequency"),
+    pt.cols = pt.cols)$plot
+
+  ggsave(file.path(cycif_fig_dir, "umap", "tme", "cluster_freq", paste0("freq_",ut,".pdf")),p,width=5,height=7,units="in",dpi=300)
+}
+```
+
+```{r}
+frnn7.cmb$cluster_tme <- NA
+frnn7.cmb$cluster_tme[is.sele.tme] <- as.character(dt.tme.1$cluster)
+```
+
+### Propagate cluster_tme to the Full Cell Population
+
+`cluster_tme` above is only assigned for the `is.sele.tme` subsample (~1-3% of cells per
+cell type) that the TME-level Leiden clustering was actually run on -- Leiden has no direct
+"predict for new points" the way a centroid-based method does, since it operates on a
+neighbor graph, not a parametric model. Extend it to the remaining ~97-99% of cells via k-NN
+majority-vote label propagation: for each out-of-sample cell, find its nearest neighbors
+(in the same RCN-composition + expression feature space Leiden was run on -- `mat.cmb.all`,
+scaled using the `is.sele.tme` reference population's own center/scale, matching
+`mat.cmb_scaled`) among the `is.sele.tme`-labeled cells, and take the majority `cluster_labels`
+vote among those neighbors.
+```{r}
+ref_scaled <- mat.cmb_scaled  # is.sele.tme population, already scaled -- Leiden's own input
+ref_cols <- colnames(ref_scaled)
+
+cat("ncol(mat.cmb.all):", ncol(mat.cmb.all),
+    "| ncol(ref_scaled):", length(ref_cols),
+    "| duplicated colnames in mat.cmb.all:", sum(duplicated(colnames(mat.cmb.all))),
+    "| all ref_cols in mat.cmb.all:", all(ref_cols %in% colnames(mat.cmb.all)), "\n")
+
+query_idx <- which(!is.sele.tme & stats::complete.cases(mat.cmb.all))
+query_mat <- as.matrix(mat.cmb.all)[query_idx, ref_cols, drop = FALSE]
+storage.mode(query_mat) <- "numeric"
+stopifnot(ncol(query_mat) == length(ref_cols))
+
+query_scaled <- scale(
+  query_mat,
+  center = attr(ref_scaled, "scaled:center")[ref_cols],
+  scale  = attr(ref_scaled, "scaled:scale")[ref_cols]
+)
+
+k_prop <- 20
+nn_prop <- FNN::get.knnx(data = ref_scaled, query = query_scaled, k = k_prop)
+
+propagated_cluster <- apply(nn_prop$nn.index, 1, function(idx) {
+  votes <- cluster_labels[idx]
+  names(sort(table(votes), decreasing = TRUE))[1]
+})
+
+frnn7.cmb$cluster_tme[query_idx] <- paste0("TME_", propagated_cluster)
+
+cat("cluster_tme coverage after propagation:",
+    sum(!is.na(frnn7.cmb$cluster_tme)), "/", nrow(frnn7.cmb),
+    sprintf("(%.1f%%)\n", 100 * mean(!is.na(frnn7.cmb$cluster_tme))))
+```
+
+## ---- Export for Notebook 6 ----
+
+`6_cycif_spatial_continued.Rmd` gets its shared setup objects (`cs7` from `cs7.rds`, `pd7`,
+etc.) directly from the same checkpoint files this notebook loads, so only what's genuinely
+new here -- `dt.tme.1`, `frnn7.cmb` (with `cluster_tme` now assigned), `ct.cols17`, and
+`is.sele.tme` -- needs to be exported. `frnn7.cmb` is also merged here with `cluster_mac`
+from `4`'s `cycif7_macrophage_clusters.rds` (same base checkpoint, so row order matches) to
+produce the combined checkpoint `6` actually loads.
+```{r}
+saveRDS(dt.tme.1, file.path(cycif_obj_dir, "cycif7_tme_cluster_assignments.rds"))
+saveRDS(frnn7.cmb, file.path(cycif_obj_dir, "cycif7_tme_clusters.rds"))
+
+save(ct.cols17, is.sele.tme,
+     file = file.path(cycif_obj_dir, "cycif7_tme_colors_and_selection.rda"))
+
+frnn7.cmb$cluster_mac <- readRDS(file.path(cycif_obj_dir, "cycif7_macrophage_clusters.rds"))$cluster_mac
+saveRDS(frnn7.cmb, file.path(cycif_obj_dir, "cycif7_tme_and_macrophage_clusters.rds"))
+```

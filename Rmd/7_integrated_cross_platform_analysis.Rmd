@@ -1,0 +1,430 @@
+---
+author: "Kenichi Shimada"
+date: "2023-03-10"
+title: "data integration"
+---
+
+Harmonizes shared markers across IO360 and DSP protein data, subsets shared clinical
+cohorts, computes cross-platform correlation summaries, compares CyCIF with other
+technologies, and fits integrated CD8 signal models.
+
+**Required run order: `1` -> `2` -> `7` (this notebook).**
+(This notebook loads IO360 and DSP Protein checkpoints produced by `1` and `2`.)
+
+## ---- Initial Setup ----
+
+### Load Configuration
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+if (!requireNamespace("CycifAnalyzeR", quietly = TRUE)) {
+  remotes::install_github("<org>/CycifAnalyzeR")
+}
+library(CycifAnalyzeR)
+source(file.path(root_dir,"functions","plotting.R"))
+source(file.path(source_dir, "io.R"))
+```
+
+## ---- Define Shared Inputs for Retained Figures ----
+
+### Load Expression Data
+
+Both loaded from precomputed checkpoints (`io360_expression_input_data.rda`,
+`dsp_protein_expression_input_data.rda`) rather than independently re-reading the raw
+source files -- `df.dsp.all` already reflects the same patient-exclusion criteria applied
+upstream when the checkpoint was built.
+```{r}
+load_io360_expression_data()
+io360 <- df.io360
+
+load(file.path(protein_obj_dir, "dsp_protein_expression_input_data.rda")) # df.dsp.all, all.prots
+```
+
+### Harmonize Shared Markers
+```{r}
+prot.lookup <- load_dsp_protein_lookup()
+prot.lookup$SYMBOL[37] <- "TMEM173"
+
+hugos <- unlist(strsplit(prot.lookup$SYMBOL, ";"))
+gns.io <- colnames(io360)[-1]
+all.comm <- intersect(hugos, gns.io)
+
+syms <- prot.lookup$SYMBOL
+lns <- sapply(strsplit(syms, ";"), length)
+all.syms <- unlist(strsplit(syms, ";"))
+df.syms <- data.frame(idx = rep(seq_along(syms), lns), symbol = all.syms)
+
+all.comm.syms.idx <- df.syms %>%
+  filter(symbol %in% all.comm) %>%
+  pull(idx) %>%
+  unique()
+all.comm.syms <- prot.lookup$Protein[all.comm.syms.idx]
+```
+
+### Load Clinical Metadata and Subset Samples
+```{r}
+clin.all <- load_clinical_metadata("clinical_metadata.rds") %>%
+  mutate(bt3 = paste0(BRCA, "_", TimePoint)) %>%
+  mutate(bt3 = factor(bt3, levels = c("MUT_BS", "MUT_BX2", "MUT_BX3", "WT_BS", "WT_BX2", "WT_BX3")))
+
+io.1 <- io360 %>%
+  select(1, !!!syms(all.comm)) %>%
+  mutate(PT = factor(PT)) %>%
+  filter(PT %in% clin.all$PT)
+
+prot.1 <- df.dsp.all %>%
+  select(PT, segment, !!!syms(all.comm.syms)) %>%
+  mutate(PT = factor(PT)) %>%
+  filter(PT %in% clin.all$PT)
+
+prot.1s <- prot.1 %>%
+  filter(segment == "Stroma") %>%
+  group_by(PT) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+prot.1t <- prot.1 %>%
+  filter(segment == "Tumor") %>%
+  group_by(PT) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+prot.1m <- prot.1 %>%
+  group_by(PT) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+```
+
+### Define Patient Colors
+```{r}
+pd <- clin.all
+n.pts <- pd %>% pull(Patient.ID) %>% unique() %>% length()
+
+if (n.pts > 12) {
+  set.seed(123)
+  col1 <- sample(colorRampPalette(RColorBrewer::brewer.pal(11, "Spectral"))(n.pts))
+} else {
+  col1 <- RColorBrewer::brewer.pal(length(unique(pd$Patient.ID)), "Set3")
+}
+
+names(col1) <- unique(pd$Patient.ID)
+pt.cols <- unique(col1[pd$Patient.ID])
+names(pt.cols) <- unique(pd$Patient.ID)
+```
+
+## ---- Compare CyCIF with Other Technologies ----
+
+### Prepare CyCIF and Cross-Platform Inputs
+```{r}
+cs5 <- readRDS(file.path(cycif_obj_dir, "cs5.rds"))
+cs7 <- readRDS(file.path(cycif_obj_dir, "cs7.rds"))
+
+excluded_ids <- c("1001-3", "1019-3")
+used.pt5 <- names(cs5)[!names(cs5) %in% excluded_ids]
+used.pt7 <- names(cs7)[!names(cs7) %in% excluded_ids]
+cs5 <- cs5[used.pt5]
+cs7 <- cs7[used.pt7]
+
+tab5 <- table(cell_types(cs5))
+tab7 <- table(cell_types(cs7))
+
+n5 <- apply(tab5, 1, function(x) x / sum(x))
+n7 <- apply(tab7, 1, function(x) x / sum(x))
+colnames(n5) <- used.pt5
+colnames(n7) <- used.pt7
+
+cy5 <- n5
+cy5["Mac_CD68", ] <- cy5["Mac_CD68", ] + cy5["Mac_CD68_CD163", ]
+cy5["Mac_CD163", ] <- cy5["Mac_CD163", ] + cy5["Mac_CD68_CD163", ]
+cy5["T_other", ] <- cy5["CD4T", ] + cy5["T_other", ] + cy5["CD8T", ]
+rownames(cy5)[6] <- "T"
+cy5 <- cy5[c("CD8T", "T", "Tumor_panCK", "Mac_CD68", "Mac_CD163"), ]
+```
+
+## ---- Integrated CD8 Signal ----
+
+### Prepare CD8 Inputs
+```{r}
+i1 <- io360 %>%
+  left_join(clin.all, by = "PT") %>%
+  filter(!is.na(BRCA)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  )
+
+i3 <- prot.1m %>%
+  left_join(clin.all, by = "PT") %>%
+  filter(!is.na(BRCA)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  )
+
+i3t <- prot.1t %>%
+  left_join(clin.all, by = "PT") %>%
+  filter(!is.na(BRCA)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  )
+
+i3s <- prot.1s %>%
+  left_join(clin.all, by = "PT") %>%
+  filter(!is.na(BRCA)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  )
+
+i4 <- t(cy5) %>%
+  as.data.frame() %>%
+  rownames_to_column("PT") %>%
+  left_join(clin.all, by = "PT") %>%
+  filter(!is.na(BRCA)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  )
+```
+
+### [Fig 4D] Platform-Specific CD8 Signals
+```{r}
+dir.create(file.path(integrated_fig_dir, "CD8T"), recursive = TRUE, showWarnings = FALSE)
+
+p1 <- plot_ct(
+  i1,
+  y_var = "CD8A",
+  y_label = "CD8A Expression",
+  title = "CD8A (IO360)",
+  ymin = NULL,
+  pt.cols = pt.cols
+)
+
+p3 <- plot_ct(
+  i3,
+  y_var = "CD8",
+  y_label = "CD8 Expression",
+  title = "CD8 (Protein)",
+  ymin = NULL,
+  pt.cols = pt.cols
+)
+
+p4 <- plot_ct(
+  i4,
+  y_var = "CD8T",
+  y_label = "CD8+ T cell Frequency",
+  title = "CD8T (CyCIF)",
+  ymin = NULL,
+  pt.cols = pt.cols
+)
+
+pdf(file.path(integrated_fig_dir, "CD8T", "cd8t_io360_v2.pdf"), width = 5, height = 7)
+print(p1$plot)
+dev.off()
+
+pdf(file.path(integrated_fig_dir, "CD8T", "cd8t_prot_v2.pdf"), width = 5, height = 7)
+print(p3$plot)
+dev.off()
+
+pdf(file.path(integrated_fig_dir, "CD8T", "cd8t_cycif_v2.pdf"), width = 5, height = 7)
+print(p4$plot)
+dev.off()
+```
+
+### [Fig 4E] Integrated CD8 Model
+```{r}
+i1.0 <- i1 %>% ungroup() %>% select(PT, CD8A) %>% dplyr::rename(CD8A_IO360 = CD8A)
+i4.0 <- i4 %>% ungroup() %>% select(PT, CD8T) %>% dplyr::rename(CD8T_CyCIF = CD8T)
+
+i1.0$CD8A_IO360 <- scale(i1.0$CD8A_IO360, center = TRUE, scale = TRUE)
+i4.0$CD8T_CyCIF <- scale(i4.0$CD8T_CyCIF, center = TRUE, scale = TRUE)
+
+raw.exp <- clin.all %>%
+  select(PT) %>% unique() %>%
+  left_join(i1.0, by = "PT") %>%
+  left_join(i4.0, by = "PT") %>%
+  gather(key = "tech", value = "CD8", CD8A_IO360:CD8T_CyCIF) %>%
+  mutate(
+    tech = factor(tech, levels = c("CD8A_IO360", "CD8T_CyCIF")),
+    PT = factor(PT)
+  )
+
+lm1 <- lmer(CD8 ~ PT + (1 | tech), data = raw.exp)
+coefs <- summary(lm1)$coefficient[, "Estimate"]
+coefs1 <- coefs[1] + c(`PT1001-1` = 0, coefs[-1])
+
+df.coef <- clin.all %>%
+  left_join(data.frame(PT = sub("PT", "", names(coefs1)), CD8 = coefs1), by = "PT") %>%
+  filter(!is.na(CD8)) %>%
+  group_by(Patient.ID) %>%
+  mutate(
+    max_bn = max(as.numeric(TimePoint)),
+    text = ifelse(as.numeric(TimePoint) == max_bn, as.character(Patient.ID), "")
+  ) %>%
+  ungroup()
+
+p <- plot_ct(
+  df.coef,
+  y_var = "CD8",
+  y_label = "CD8 (normalized)",
+  title = "CD8 (IO360 & CyCIF)",
+  pt.cols = pt.cols
+)
+
+pdf(file.path(integrated_fig_dir, "CD8T", "cd8_integrated_v2.pdf"), width = 5, height = 7)
+print(p)
+dev.off()
+```
+
+### [EDF5D] Difference Between BX2 and BS, BX3 and BS
+```{r}
+i1d <- i1 %>%
+  select(Patient.ID, TimePoint, CD8A) %>%
+  spread(TimePoint, CD8A) %>%
+  mutate(
+    dBX2 = BX2 - BS,
+    dBX3 = BX3 - BS
+  ) %>%
+  select(Patient.ID, dBX2, dBX3)
+
+i3td <- i3t %>%
+  select(Patient.ID, TimePoint, CD8) %>%
+  spread(TimePoint, CD8) %>%
+  mutate(
+    dBX2 = BX2 - BS,
+    dBX3 = BX3 - BS
+  ) %>%
+  select(Patient.ID, dBX2, dBX3)
+
+i3sd <- i3s %>%
+  select(Patient.ID, TimePoint, CD8) %>%
+  spread(TimePoint, CD8) %>%
+  mutate(
+    dBX2 = BX2 - BS,
+    dBX3 = BX3 - BS
+  ) %>%
+  select(Patient.ID, dBX2, dBX3)
+
+i4d <- i4 %>%
+  select(Patient.ID, TimePoint, CD8T) %>%
+  spread(TimePoint, CD8T) %>%
+  mutate(
+    dBX2 = BX2 - BS,
+    dBX3 = BX3 - BS
+  ) %>%
+  select(Patient.ID, dBX2, dBX3)
+
+i5d <- df.coef %>%
+  select(Patient.ID, TimePoint, CD8) %>%
+  spread(TimePoint, CD8) %>%
+  mutate(
+    dBX2 = BX2 - BS,
+    dBX3 = BX3 - BS
+  ) %>%
+  select(Patient.ID, dBX2, dBX3)
+
+d.exp <- clin.all %>%
+  select(Patient.ID) %>% unique() %>%
+  left_join(i1d, by = "Patient.ID") %>%
+  left_join(i3td, by = "Patient.ID") %>%
+  left_join(i3sd, by = "Patient.ID") %>%
+  left_join(i4d, by = "Patient.ID") %>%
+  left_join(i5d, by = "Patient.ID") %>%
+  mutate(Patient.ID = factor(Patient.ID))
+
+colnames(d.exp) <- c(
+  "Patient.ID",
+  "dBX2_IO360", "dBX3_IO360",
+  "dBX2_Prot_Tumor", "dBX3_Prot_Tumor",
+  "dBX2_Prot_Stroma", "dBX3_Prot_Stroma",
+  "dBX2_CyCIF", "dBX3_CyCIF",
+  "dBX2_integrated", "dBX3_integrated"
+)
+
+lev.pts <- levels(d.exp$Patient.ID)
+d.exp <- as.matrix(d.exp[-1])
+rownames(d.exp) <- lev.pts
+
+sds <- sapply(1:5, function(j) {
+  j1 <- j * 2 + (-1:0)
+  sd(d.exp[, j1], na.rm = TRUE)
+})
+
+nd.exp <- d.exp / array(rep(sds, each = 2)[col(d.exp)], dim = dim(d.exp))
+
+pdf(file.path(integrated_fig_dir, "CD8T", "diff_BX2_BX3_all_technologies_v4.pdf"), width = 7, height = 7)
+h3(
+  nd.exp[rev(seq_len(nrow(nd.exp))), ],
+  Colv = NA,
+  Rowv = NA,
+  balanceColor = TRUE,
+  scale = "none",
+  margins = c(10, 10),
+  main = "diff in CD8 from BS"
+)
+dev.off()
+```
+
+### [EDF5C] Heatmap of BX2/BS and BX3/BS Differences
+```{r}
+d.bx2 <- nd.exp[, grep("BX2", colnames(nd.exp))[1:4]]
+d.bx3 <- nd.exp[, grep("BX3", colnames(nd.exp))[1:4]]
+
+cor2 <- cor(d.bx2, use = "pairwise.complete.obs")
+cor3 <- cor(d.bx3, use = "pairwise.complete.obs")
+
+rownames(cor2) <- colnames(cor2) <- rownames(cor3) <- colnames(cor3) <- c("IO360", "DSP, Tumor", "DSP, Stroma", "CyCIF")
+
+shared_colors <- colorRampPalette(c("navy", "white", "firebrick3"))(101)
+col_fun <- circlize::colorRamp2(seq(-1, 1, length.out = length(shared_colors)), shared_colors)
+lgd_at <- c(-1, -0.5, 0, 0.5, 1)
+
+pdf(file.path(integrated_fig_dir, "CD8T", "correlation_BX2_v5_ComplexHeatmap.pdf"), width = 7, height = 7)
+ComplexHeatmap::draw(
+  Heatmap(
+    as.matrix(cor2),
+    name = "Correlation",
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_dend = TRUE,
+    show_column_dend = TRUE,
+    heatmap_legend_param = list(
+      at = lgd_at,
+      labels = lgd_at,
+      title = "r",
+      legend_height = unit(35, "mm")
+    )
+  )
+)
+dev.off()
+
+pdf(file.path(integrated_fig_dir, "CD8T", "correlation_BX3_v5_ComplexHeatmap.pdf"), width = 7, height = 7)
+ComplexHeatmap::draw(
+  Heatmap(
+    as.matrix(cor3),
+    name = "Correlation",
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_dend = TRUE,
+    show_column_dend = TRUE,
+    heatmap_legend_param = list(
+      at = lgd_at,
+      labels = lgd_at,
+      title = "r",
+      legend_height = unit(35, "mm")
+    )
+  )
+)
+dev.off()
+```

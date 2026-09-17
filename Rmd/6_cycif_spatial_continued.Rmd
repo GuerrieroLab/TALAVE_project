@@ -1,0 +1,3339 @@
+---
+title: "TALAVE CyCIF analysis: spatial FRNN + TME clustering (part 2 of 2)"
+author: "Kenichi Shimada"
+---
+
+# TALAVE CyCIF analysis
+
+Continues the spatial pipeline: adjacent-cell and tumor-border distances, tumor density,
+macrophage and T-cell spatial programs, TS ratios, and marker-density regressions.
+
+**Required run order: `3` -> `4` -> `5` -> `6` (this notebook).**
+(This notebook resumes directly from `5`'s output.)
+
+## ---- Initial Setup ----
+
+### Load Configuration
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+if (!requireNamespace("CycifAnalyzeR", quietly = TRUE)) {
+  remotes::install_github("<org>/CycifAnalyzeR")
+}
+library(CycifAnalyzeR)
+source(file.path(root_dir,"functions","plotting.R"))
+source(file.path(source_dir, "plotting_cycif.R"))
+source(file.path(source_dir, "analysis_cycif.R"))
+source(file.path(source_dir, "io.R"))
+```
+
+### CyCIF-Specific Colors
+```{r}
+brca.fills = c(MUT="#C9C0DD", WT="#D9DADA")
+brca.cols = c(MUT="#62439c", WT="#58575f")
+brca.mids = c(MUT="#62439c", WT = "grey60")
+```
+
+## ---- Load Inputs from 5 ----
+
+Resumes the spatial FRNN + TME-clustering pipeline from `5_cycif_spatial_frnn_tme.Rmd`, which
+merges in the macrophage clustering from `4_cycif_umap_analysis.Rmd` before saving the
+combined checkpoint this notebook loads.
+
+```{r}
+cs7 <- readRDS(file.path(cycif_obj_dir, "cs7.rds"))
+load(file.path(cycif_obj_dir, "cycif_spatial_frnn_input_data.rda")) # frnn7.cmb, frnn7.exp, frnn7.rcn, is.sele.7
+
+pd7 <- pData(cs7)
+cts7d <- cell_types(cs7) %>% filter(!is.na(cell_types))
+cst7.abs <- colnames(cs7@cell_types$default@cell_state_def)
+ct.cols7 <- get_cycif_ct_colors()
+ct.cols7w <- get_cycif_ct_colors_white_blend()
+uniq.cts <- get_cycif_uniq_cts()
+nms7 <- names(cs7)
+pt.cols <- load_pt_colors()
+
+lst.dists7 <- readRDS(file.path(cycif_obj_dir, "cycif7_tumor_border_distances_by_sample.rds"))
+lst.frnn7 <- readRDS(file.path(cycif_obj_dir, "cycif7_neighborhood_composition_by_sample.rds"))
+
+load(file.path(cycif_obj_dir, "cycif7_tme_colors_and_selection.rda")) # ct.cols17, is.sele.tme
+dt.tme.1 <- readRDS(file.path(cycif_obj_dir, "cycif7_tme_cluster_assignments.rds"))
+
+frnn7.cmb <- readRDS(file.path(cycif_obj_dir, "cycif7_tme_and_macrophage_clusters.rds")) # cluster_tme populated for all cells (propagated); cluster_mac only for the down-sampled is.sele.mac subset, NA elsewhere
+```
+
+### [Fig 6F, 6G, 6K, EDF10C, EDF10D, EDF10E, EDF10F] TME Cluster Associations and Marker States
+```{r}
+frnn7.cmb <- frnn7.cmb %>%
+  mutate(cluster_tme = factor(cluster_tme,levels=paste0("TME_",1:17))) %>%
+  mutate(cluster_mac = factor(cluster_mac,levels=paste0("Mac_",1:10)))
+```
+
+#### Macrophage neighbor-count per TME cluster
+
+For each TME cluster, counts macrophages (`Mac_CD68`/`Mac_CD68_CD163`/`Mac_CD163`) among the
+spatial neighbors of every cell assigned to that cluster, then labels each macrophage with
+the (at most one) TME cluster it borders.
+```{r}
+mac_types <- c("Mac_CD68","Mac_CD68_CD163","Mac_CD163")
+
+tme_targets <- paste0("TME_",1:17)
+newcols <- paste0("mac_neighbor_count_", tme_targets)
+
+for (tme in tme_targets) {
+  message("Processing ", tme, "...")
+
+  newcol <- paste0("mac_neighbor_count_", tme)
+  frnn7.cmb[[newcol]] <- NA_real_
+
+  for (sm in names(lst.frnn7)) {
+    obj <- lst.frnn7[[sm]]
+    neigh_list <- obj@nn@id
+    cts_sample <- cts7d %>% filter(sample == sm)
+
+    idx_cmb <- which(frnn7.cmb$sample == sm)
+    cmb_sub <- frnn7.cmb[idx_cmb, ]
+
+    idx_tme_local <- which(!is.na(cmb_sub$cluster_tme) &
+                             cmb_sub$cluster_tme == tme)
+    if (length(idx_tme_local) == 0) next
+
+    neigh_all <- unlist(neigh_list[idx_tme_local])
+
+    mac_local_ids <- which(cts_sample$cell_types %in% mac_types)
+
+    tab_all <- table(neigh_all)
+
+    mac_count_local <- rep(NA_real_, nrow(cmb_sub))
+
+    mac_count_local[mac_local_ids] <- tab_all[as.character(mac_local_ids)]
+
+    mac_count_local[mac_local_ids][is.na(mac_count_local[mac_local_ids])] <- 0
+
+    frnn7.cmb[[newcol]][idx_cmb[idx_tme_local]] <- 
+      mac_count_local[idx_tme_local]
+  }
+}
+```
+
+```{r}
+macs.nb <- frnn7.cmb %>% 
+  dplyr::select(cell_types,!!!syms(newcols))
+macs.nb$shared_tme_n <- macs.nb %>%
+  dplyr::select(all_of(newcols)) %>%
+  mutate(across(everything(), ~ .x > 0)) %>%
+  rowSums(na.rm = TRUE)
+table(macs.nb$shared_tme_n)
+
+frnn7.cmb <- frnn7.cmb %>%
+  mutate(tme_neighbor_label = apply(
+      macs.nb[newcols] > 0, 1, 
+      function(x) {
+        if (!any(x, na.rm = TRUE)) return(NA_character_)
+        tme_targets[which(x)]
+      }
+    ),
+    tme_neighbor_label = factor(tme_neighbor_label, levels = tme_targets)
+  )
+```
+
+#### CD163+ macrophage frequency: TME_5 vs TME_12 vs other clusters
+
+Paired Wilcoxon tests, per sample, comparing the mean fraction of neighborhood macrophages
+(CD68+, CD163+, or CD68+/CD163+ double-positive) that are the CD163+ subtype, between TME_5,
+TME_12, and all other clusters.
+```{r}
+n.cd163 <- as.data.frame(frnn7.rcn[is.sele.tme, ]) %>%
+  mutate(
+    total_mac  = Mac_CD68 + Mac_CD163 + Mac_CD68_CD163,
+    frac_CD163 = ifelse(total_mac > 0, Mac_CD163 / total_mac, NA_real_)
+  ) %>%
+  bind_cols(
+    frnn7.cmb %>%
+      filter(is.sele.tme) %>%
+      dplyr::select(sample, cluster_tme)
+  ) %>%
+  mutate(
+    tme_group = case_when(
+      cluster_tme == "TME_5"  ~ "TME_5",
+      cluster_tme == "TME_12" ~ "TME_12",
+      TRUE                    ~ "others"
+    ),
+    tme_group = factor(tme_group, levels = c("TME_5", "TME_12", "others"))
+  ) %>%
+  dplyr::select(tme_group, sample, frac_CD163) %>%
+  group_by(tme_group, sample) %>%
+  summarise(mean_frac_CD163 = mean(frac_CD163, na.rm = TRUE), .groups = "drop")
+
+df.paired <- n.cd163 %>%
+  pivot_wider(
+    names_from = tme_group,
+    values_from = mean_frac_CD163
+  ) %>%
+  filter(
+    !is.na(TME_5),
+    !is.na(TME_12),
+    !is.na(others)
+  )
+
+p_5_12   <- wilcox.test(df.paired$TME_5, df.paired$TME_12, paired = TRUE)$p.value
+p_12_oth <- wilcox.test(df.paired$TME_12, df.paired$others, paired = TRUE)$p.value
+p_5_oth  <- wilcox.test(df.paired$TME_5, df.paired$others, paired = TRUE)$p.value
+
+p_adj <- p.adjust(c(p_5_12, p_12_oth, p_5_oth), method = "BH")
+
+df_plot <- df.paired %>%
+  dplyr::select(sample, TME_5, TME_12, others) %>%
+  pivot_longer(
+    cols = c(TME_5, TME_12, others),
+    names_to = "region",
+    values_to = "value"
+  ) %>%
+  mutate(
+    region = factor(region, levels = c("TME_5","TME_12","others")),
+    x = case_when(
+      region == "TME_5" ~ 1,
+      region == "TME_12" ~ 2,
+      region == "others" ~ 3
+    )
+  ) %>%
+  arrange(sample, x)
+
+
+y_base <- max(df_plot$value, na.rm = TRUE)
+
+ann_df <- tibble(
+  x = c(1.1, 2.1, 1.1),
+  xend = c(1.9, 2.9, 2.9),
+  xlab = c(1.5, 2.5, 2.0),
+  y = c(y_base*1.06, y_base*1.06, y_base*1.15),
+  label = signif(p_adj, 2)
+)
+
+p <- ggplot(df_plot, aes(x = x, y = value, group = sample)) +
+  geom_path(color="grey70", linewidth=0.4) +
+  geom_point(aes(color=region), size=2) +
+  stat_summary(
+    aes(group = region),
+    fun = median,
+    geom = "crossbar",
+    width = 0.35,
+    color = "black",
+    fatten = 1,
+    linewidth = 0.5
+  ) +
+
+  geom_segment(
+    data = ann_df,
+    inherit.aes = FALSE,
+    aes(x=x, xend=xend, y=y, yend=y),
+    linewidth=0.6
+  ) +
+
+  geom_text(
+    data = ann_df,
+    inherit.aes = FALSE,
+    aes(x=xlab, y=y, label=label),
+    vjust=-0.25,
+    size=4
+  ) +
+
+  scale_x_continuous(
+    breaks=c(1,2,3),
+    labels=c("TME_5","TME_12","others"),
+    expand = expansion(mult = c(0.1, 0.1))    
+  ) +
+  
+  scale_y_continuous(
+    expand = expansion(mult = c(0.1, 0.1))   
+  ) +
+
+  scale_color_manual(
+    values=c(
+      ct.cols17[c(5,12)],
+      "others"="grey40"
+    )
+  ) +
+
+  labs(
+    title="CD163+ macs",
+    x=NULL,
+    y="Mean fraction of macrophages\nthat are CD163+ (per sample)"
+  ) +
+
+  theme_bw(base_size=14) +
+  theme(
+    legend.position="none",
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1)
+  )
+
+ggsave(
+  file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "mean_cd163_frac_by_tme.pdf"),
+  p, width = 2.5, height = 4, units = "in", dpi = 300
+)
+
+```
+
+#### Neighboring T cells per CD163+ macrophage: TME_5 vs TME_12 vs other clusters
+
+Same TME_5/TME_12/others grouping and paired-Wilcoxon approach as above, now applied per
+T-cell subtype (CD8T/CD4T/T_other) to the count of that T-cell type among each CD163+
+macrophage's spatial neighbors.
+```{r}
+n.t.per.mac <- frnn7.cmb %>%
+  filter(
+    cell_types %in% "Mac_CD163",
+    !is.na(tme_neighbor_label)
+  ) %>%
+  mutate(
+    is_tme5_12 = case_when(
+      tme_neighbor_label == "TME_5"  ~ "TME_5",
+      tme_neighbor_label == "TME_12" ~ "TME_12",
+      TRUE                           ~ "others"
+    ),
+    is_tme5_12 = factor(is_tme5_12, levels = c("TME_5","TME_12","others"))
+  ) %>%
+  dplyr::select(cell_types, is_tme5_12, CD4T, CD8T, T_other, sample) %>%
+  pivot_longer(
+    cols = c("CD4T","CD8T","T_other"),
+    names_to = "T_cell_type",
+    values_to = "n_T_cells"
+  ) %>%
+  mutate(T_cell_type = factor(T_cell_type, levels = c("CD8T","CD4T","T_other")))
+
+df.sample <- n.t.per.mac %>%
+  group_by(sample, T_cell_type, is_tme5_12) %>%
+  summarize(
+    mean_T = mean(n_T_cells, na.rm = TRUE),
+    n_mac  = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(T_cell_type = factor(T_cell_type, levels = c("CD8T","CD4T","T_other")))
+
+df.sample %>%
+  count(T_cell_type, is_tme5_12)
+
+df.paired <- df.sample %>% 
+  pivot_wider(
+    names_from = is_tme5_12,
+    values_from = c(mean_T, n_mac),
+    names_sep = "_"
+  ) %>%
+  filter(
+    !is.na(mean_T_TME_5),
+    !is.na(mean_T_TME_12),
+    !is.na(mean_T_others)
+  ) %>%
+  mutate(T_cell_type = factor(T_cell_type, levels = c("CD8T","CD4T","T_other")))
+
+
+df_plot <- df.paired %>%
+  dplyr::select(sample, T_cell_type, mean_T_TME_5, mean_T_TME_12, mean_T_others) %>%
+  pivot_longer(
+    cols = c(mean_T_TME_5, mean_T_TME_12, mean_T_others),
+    names_to = "region",
+    values_to = "value"
+  ) %>%
+  mutate(
+    region = factor(
+      region,
+      levels = c("mean_T_TME_5", "mean_T_TME_12", "mean_T_others"),
+      labels = c("TME_5", "TME_12", "others")
+    ),
+    x = case_when(
+      region == "TME_5"  ~ 1,
+      region == "TME_12" ~ 2,
+      region == "others" ~ 3
+    )
+  ) %>%
+  arrange(T_cell_type, sample, x)
+
+stats <- df.paired %>%
+  group_by(T_cell_type) %>%
+  summarize(
+    p_5_12   = wilcox.test(mean_T_TME_5, mean_T_TME_12, paired = TRUE)$p.value,
+    p_12_oth = wilcox.test(mean_T_TME_12, mean_T_others, paired = TRUE)$p.value,
+    p_5_oth  = wilcox.test(mean_T_TME_5, mean_T_others, paired = TRUE)$p.value,
+    y_base   = max(c(mean_T_TME_5, mean_T_TME_12, mean_T_others), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj_5_12   = p.adjust(p_5_12, method = "BH"),
+    p_adj_12_oth = p.adjust(p_12_oth, method = "BH"),
+    p_adj_5_oth  = p.adjust(p_5_oth, method = "BH")
+  )
+
+y_ref <- stats %>%
+  filter(T_cell_type == "CD4T") %>%
+  pull(y_base)
+
+if (length(y_ref) == 0) {
+  y_ref <- max(df_plot$value, na.rm = TRUE)
+}
+
+y_12 <- y_ref * 1.12
+y_23 <- y_ref * 1.12
+y_13 <- y_ref * 1.28
+
+seg_pad <- 0.08
+
+ann_df <- bind_rows(
+  stats %>%
+    transmute(
+      T_cell_type,
+      x = 1 + seg_pad, xend = 2 - seg_pad,
+      xlab = 1.5,
+      y = y_12,
+      p_adj = p_adj_5_12
+    ),
+  stats %>%
+    transmute(
+      T_cell_type,
+      x = 2 + seg_pad, xend = 3 - seg_pad,
+      xlab = 2.5,
+      y = y_23,
+      p_adj = p_adj_12_oth
+    ),
+  stats %>%
+    transmute(
+      T_cell_type,
+      x = 1 + seg_pad, xend = 3 - seg_pad,
+      xlab = 2.0,
+      y = y_13,
+      p_adj = p_adj_5_oth
+    )
+) %>%
+  mutate(
+    label = signif(p_adj, 2),
+    T_cell_type = factor(T_cell_type, levels = c("CD8T", "CD4T", "T_other"))
+  )
+
+y_top <- max(ann_df$y) * 1.06
+
+p <- ggplot(df_plot, aes(x = x, y = value, group = sample)) +
+  geom_path(color = "grey70", linewidth = 0.5) +
+  geom_point(aes(color = region), size = 2) +
+  stat_summary(
+    aes(group = region),
+    fun = median,
+    geom = "crossbar",
+    width = 0.35,
+    color = "black",
+    fatten = 1,
+    linewidth = 0.5
+  ) +
+  facet_wrap(~T_cell_type) +
+  geom_segment(
+    data = ann_df,
+    inherit.aes = FALSE,
+    aes(x = x, xend = xend, y = y, yend = y),
+    linewidth = 0.5,
+    color = "black"
+  ) +
+  geom_text(
+    data = ann_df,
+    inherit.aes = FALSE,
+    aes(x = xlab, y = y, label = label),
+    vjust = -0.25,
+    size = 3.8
+  ) +
+  scale_x_continuous(
+    breaks = c(1, 2, 3),
+    labels = c("TME_5", "TME_12", "others"),
+    expand = expansion(mult = c(0.15, 0.15))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.02, 0.02)),
+    limits = c(NA, y_top)
+  ) +
+  scale_color_manual(
+    values=c(
+      ct.cols17[c(5,12)],
+      "others"="grey40"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Mean neighboring T cells per CD163+ macs\n(per sample)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(size = 11),
+    axis.title.y = element_text(size = 12)
+  )
+
+ggsave(
+  file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "t_cells_per_mac_CD163_by_tme12_boxplot_v2.pdf"),
+  p, width = 4, height = 4, units = "in", dpi = 300
+)
+
+```
+
+#### Marker expression heatmaps by TME cluster
+
+`frnn7.cmb` alone serves as both `frnn_meta` and `frnn_exp` for `plot_marker_tme_heatmap()`;
+a per-sample sequential `cell_id` is added as the join key it expects.
+```{r}
+frnn7.cmb.id <- frnn7.cmb %>% group_by(sample) %>% mutate(cell_id = dplyr::row_number()) %>% ungroup()
+
+markers_use <- c("pTBK1", "PDL1", "gH2AX","cCaspase3")
+tme_levels <- tme_targets
+res_list <- lapply(markers_use, function(mk) {
+  x <- plot_marker_tme_heatmap(
+    marker = mk,
+    tme_levels = tme_levels,
+    frnn_meta = frnn7.cmb.id,
+    frnn_exp = frnn7.cmb.id,
+    cluster_columns = FALSE,
+    height = 6,
+    width = 4.5,
+    file = file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", paste0("heatmap_", mk, "_by_TME.pdf"))
+  )
+})
+
+names(res_list) <- markers_use
+```
+
+
+### [Fig 6M, EDF10G] TME Marker Scatterplots
+
+#### TME-cluster–colored scatterplots
+```{r}
+ab_pairs <- list(
+  c("PDL1","cCaspase3"),
+  c("gH2AX", "pTBK1")
+)
+
+scatters <- list()
+
+for (pair in ab_pairs) {
+  ab1 <- pair[1]
+  ab2 <- pair[2]
+
+  xlab_text <- if (ab1 == "gH2AX") {
+    expression(gamma * "H2AX (CN)")
+  } else {
+    paste0(ab1, " (CN)")
+  }
+
+  dt.tme.1s <- dt.tme.1 %>%
+    mutate(cluster = if_else(cluster %in% c("TME_5","TME_11", "TME_12", "TME_16"),
+                             cluster,
+                             "others")) %>%
+    mutate(cluster = factor(cluster, levels = c("TME_16","TME_5","TME_12","TME_11","others"))) %>%
+    arrange(desc(cluster)) %>%
+    filter(gH2AX > -1 | pTBK1 > -1)
+
+  set.seed(123)
+
+  important <- c("TME_5","TME_11","TME_12","TME_16")
+
+  dt.tme.1s <- dt.tme.1s %>%
+    mutate(is_imp = cluster %in% important) %>%
+    arrange(desc(is_imp)) %>%
+    mutate(rand = runif(n())) %>%
+    arrange(is_imp, rand) %>%
+    dplyr::select(-is_imp, -rand)
+
+  p_main <- ggplot(dt.tme.1s , aes(x = .data[[ab1]], y = .data[[ab2]], col = cluster)) +
+    geom_point() +
+    scale_color_manual(values = c(ct.cols17,others="grey70")) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 28,color="black"),
+      axis.title = element_text(size = 32,color="black"),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1,color="black")
+    ) +
+    xlab(xlab_text) + 
+    ylab(paste0(ab2," (CN)")) +
+    plot_annotation(
+      title = paste0(ab1," vs ",sub("ase","",ab2)),
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) 
+  ggsave(file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "cluster", paste0("scatter_",ab1,"_",ab2,"_clust_v2.png")),
+     p_main + theme(legend.position="none"), width = 7, height = 7, units = "in", dpi = 300)
+  
+}
+
+save_legend_pdf(p_main,
+              file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "cluster",
+          paste0("scatter_cluster_legend.pdf")),
+  width = 4, height = 6
+)
+```
+
+#### Neighborhood-density–colored scatterplots (by cell type / antibody)
+```{r}
+ab_pairs <- list(
+  c("PDL1","cCaspase3"),
+  c("gH2AX", "pTBK1")
+)
+
+scatters <- list()
+
+for (ct in uniq.cts[4:6]) {
+  scatters[[ct]] <- list()
+  
+  for (pair in ab_pairs) {
+    ab1 <- pair[1]
+    ab2 <- pair[2]
+    
+    xlab_text <- if (ab1 == "gH2AX") {
+      expression(gamma * "H2AX (CN)")
+    } else {
+      paste0(ab1, " (CN)")
+    }
+        
+    dt.tme.1s <- dt.tme.1 %>%
+      mutate(ct_raw = !!sym(ct)) %>%
+      mutate(
+        density = {
+          ct_vals <- ct_raw
+          q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+          pmin(pmax(ct_vals, q[1]), q[2])
+        }
+      ) %>%
+      filter(gH2AX > -1 | pTBK1 > -1)
+    
+    coords <- as.matrix(dt.tme.1s[c(ab1, ab2)])
+    knn <- get.knn(coords, k = 20)
+    knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+    
+    dt.tme.1s$density <- apply(knn_indices, 1, function(idx) {
+      mean(dt.tme.1s$density[idx], na.rm = TRUE)
+    })
+    
+    p_main <- ggplot(dt.tme.1s , aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) +
+      geom_point() +
+      scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq", name = "mean\ndensity") +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 28,color="black"),
+        axis.title = element_text(size = 32,color="black"),
+        legend.title = element_text(size = 20, margin = margin(b = 10)),
+        legend.text = element_text(size = 16),
+        legend.key.size = unit(1.2, "cm"),
+        legend.spacing.y = unit(1, "cm"),
+        legend.key.height = unit(1.2, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(size=1,color="black")
+      ) +
+      xlab(xlab_text) +
+      ylab(paste0(ab2," (CN)")) +
+      plot_annotation(
+        title = ct,
+        theme = theme(
+          plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+          plot.background = element_blank()
+        )
+      ) + common_scale(0.42)
+    
+    out_path <- file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ct",
+                          paste0("scatter_", ab1, "_", ab2, "_", ct, ".png"))
+    ggsave(out_path, p_main + theme(legend.position="none"), width = 7, height = 7, units = "in", dpi = 300)
+    
+    scatters[[ct]][[paste0(ab1, "_", ab2)]] <- p_main
+  }
+}
+
+save_legend_pdf(p_main,
+                file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ct",
+            paste0("scatter_celltype_legend.pdf")),
+  width = 4, height = 6
+)
+
+for (ab in cst7.abs[c(2,3,4,9,10)]){
+  scatters[[ab]] <- list()
+  
+  for (pair in ab_pairs) {
+    ab1 <- pair[1]
+    ab2 <- pair[2]
+  
+    xlab_text <- if (ab1 == "gH2AX") {
+      expression(gamma * "H2AX (CN)")
+    } else {
+      paste0(ab1, " (CN)")
+    }
+
+    dt.tme.1s <- dt.tme.1 %>%
+      mutate(ab_raw = .data[[ab]]) %>%
+      mutate(
+        density = {
+          ab_vals <- ab_raw
+          q <- quantile(ab_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+          pmin(pmax(ab_vals, q[1]), q[2])
+        }
+      ) %>%
+      filter(gH2AX > -1 | pTBK1 > -1)      
+    
+    coords <- as.matrix(dt.tme.1s[c(ab1, ab2)])
+    knn <- get.knn(coords, k = 20)
+    knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+    
+    dt.tme.1s$density <- apply(knn_indices, 1, function(idx) {
+      mean(dt.tme.1s$density[idx], na.rm = TRUE)
+    })
+    
+    p_main <- ggplot(dt.tme.1s , aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) +
+      geom_point() +
+      viridis::scale_color_viridis(guide = "none") +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 28,color="black"),
+        axis.title = element_text(size = 32,color="black"),
+        legend.title = element_text(size = 20, margin = margin(b = 10)),
+        legend.text = element_text(size = 16),
+        legend.key.size = unit(1.2, "cm"),
+        legend.spacing.y = unit(1, "cm"),
+        legend.key.height = unit(1.2, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(size=1,color="black")
+      ) +
+      xlab(xlab_text) +
+      ylab(paste0(ab2," (CN)")) +
+      plot_annotation(
+        title = ab,
+        theme = theme(
+          plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+          plot.background = element_blank()
+        )
+      )
+    
+    out_path <- file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ab",
+                          paste0("scatter_", ab1, "_", ab2, "_", ab, ".png"))
+    ggsave(out_path, p_main, width = 7, height = 7, units = "in", dpi = 300)
+    
+    scatters[[ab]][[paste0(ab1, "_", ab2)]] <- p_main
+  }
+}
+
+p_main <- ggplot(dt.tme.1s , aes(x = !!sym(ab1), y = !!sym(ab2), col = density)) +
+  geom_point() +
+  viridis::scale_color_viridis() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 20),
+    axis.title = element_text(size = 24),
+    legend.title = element_text(size = 20, margin = margin(b = 10)),
+    legend.text = element_text(size = 16),
+    legend.key.size = unit(1.2, "cm"),
+    legend.spacing.y = unit(1, "cm"),
+    legend.key.height = unit(1.2, "cm"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(size=1)
+  ) +
+  xlab(paste0(ab1," (log)")) + 
+  ylab(paste0(ab2," (log)")) +
+  plot_annotation(
+    title = ab,
+    theme = theme(
+      plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+      plot.background = element_blank()
+    )
+  )
+save_legend_pdf(p_main,
+                file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ab",
+            paste0("scatter_ab_legend.pdf")),
+  width = 4, height = 6
+)
+```
+### [Fig 6K, EDF10B] TME Marker Violin Plots
+```{r}
+for(ab1 in cst7.abs[c(2,3,4,9,10)]){
+  dt.tme.1s <- dt.tme.1 %>%
+    mutate(ab_raw = .data[[ab1]]) %>%
+    mutate(
+      density = {
+        ab_vals <- ab_raw
+        q <- quantile(ab_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ab_vals, q[1]), q[2])
+      }
+    ) %>%
+    mutate(cluster = if_else(cluster %in% c("TME_5","TME_11", "TME_12", "TME_16"),
+                             cluster,  # keep as is
+                             "others")) %>%    
+    filter(gH2AX > -1 | pTBK1 > -1)    
+  
+  others_med <- median(
+    dt.tme.1s %>% filter(cluster == "others") %>% pull(.data[[ab1]]),
+    na.rm = TRUE
+  )
+  
+  
+  p <- ggplot(dt.tme.1s %>%
+                mutate(cluster=factor(cluster,levels=c("TME_5","TME_11","TME_12","TME_16","others"))) ,
+              aes(x = cluster, y= .data[[ab1]], fill = cluster))+ 
+    geom_hline(yintercept = others_med, linetype = "dashed", color = "black", linewidth = 0.7) +
+    geom_violin() + 
+    scale_fill_manual(values = c(ct.cols17,others="grey70")) +  # optionally restore this
+    theme_minimal() +
+    theme(
+      axis.text = element_text(color="black",size = 28),
+      axis.text.x = element_text(angle=90,hjust = 1, vjust = 0.5),
+      axis.title = element_text(size = 28),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1)
+    ) +
+    xlab("")  + 
+    ylab(paste0(ab1," (log)")) +
+    plot_annotation(
+      title = paste0(ab1," (CN)"),
+      theme = theme(
+        plot.title = element_text(hjust =0.5, size = 50, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) + theme(legend.position="none")
+  
+  stats_df <- compute_cluster_stats(dt.tme.1s, ab1)
+  
+  ypos <- max(dt.tme.1s[[ab1]], na.rm = TRUE) *1.05
+  
+  p <- p +
+    geom_text(
+      data = stats_df,
+      aes(x = cluster, y = ypos, label = sig, color = sig_col),
+      size = 16,
+      show.legend = FALSE
+    ) +
+    scale_color_identity()
+  
+  ggsave(file.path(cycif_fig_dir, "spatial", "exps_in_tme_clusters", paste0("violin_",ab1,"_v2.pdf")),
+     p, width = 5, height = 8, units = "in", dpi = 300)
+}
+```
+
+## ---- Tumor Spatial Associations ----
+
+```{r}
+xx <- load(file.path(cycif_obj_dir,"cycif7_umap_tumor_and_macrophage.rda")) # dt.tum.1, dt.mac.1
+```
+
+
+```{r}
+dim(frnn7.cmb)
+dim(dt.tum.1)
+table(frnn7.cmb$cell_types)
+```
+
+```{r}
+lst.density <- list()
+lst.density$cd8t <- list()
+lst.density$cd4t <- list()
+lst.density$t_other <- list()
+```
+
+### Tumor Marker Relationships
+```{r}
+frnn7.cmb.tum <- frnn7.cmb %>%
+  filter(cell_types %in% c("Tumor_panCK","Tumor_neg")) %>%
+  filter(is.sele.tum) %>%
+  cbind(dt.tum.1 %>% dplyr::select(umap_x,umap_y)) %>%
+  mutate(across(all_of(uniq.cts), as.numeric))
+frnn7.cmb.mac <- frnn7.cmb %>%
+  filter(cell_types %in% c("Mac_CD68","Mac_CD163","Mac_CD68_CD163")) %>%
+  filter(is.sele.mac) %>%
+  cbind(dt.mac.1 %>% dplyr::select(umap_x,umap_y)) %>%
+  mutate(cluster = dt.mac.1 %>% pull(cluster)) %>%
+  mutate(across(all_of(uniq.cts), as.numeric))
+rngs <- list()
+for(ab1 in   paste0(c("PDL1","cCaspase3","gH2AX", "pTBK1"),".log")){
+  vals_ab1 <- c(
+    frnn7.cmb.mac[[ab1]],
+    frnn7.cmb.tum[[ab1]]
+  )
+  tmp <- vals_ab1[is.finite(vals_ab1)]
+  if(ab1 == "pTBK1.log"){
+    tmp <- tmp[tmp > -2]
+  }else if(ab1 == "gH2AX.log"){
+    tmp <- tmp[tmp > -1]
+  }
+  rngs[[ab1]] <- range(tmp)
+}
+
+
+```
+
+Classification reconstructed from `bound_coords` (`vline` = PDL1 threshold, `curve` =
+cCaspase3-vs-PDL1 boundary).
+```{r}
+bound_coords <- readRDS(file.path(cycif_obj_dir, "pdl1_cc3_boundary_coords.rds"))
+
+classify_pdl1_cc3 <- function(df, xcol = "PDL1.log", ycol = "cCaspase3.log", bc = bound_coords) {
+  x0 <- bc$vline$x
+  curve_pts <- bc$curve[order(bc$curve$x), ]
+
+  y_on_curve <- function(xq) {
+    xi <- curve_pts$x; yi <- curve_pts$y
+    xq2 <- pmin(pmax(xq, min(xi)), max(xi))
+    i <- findInterval(xq2, xi, left.open = FALSE, rightmost.closed = TRUE)
+    i <- pmin(pmax(i, 1), length(xi) - 1)
+    x1 <- xi[i]; x2 <- xi[i + 1]; y1 <- yi[i]; y2 <- yi[i + 1]
+    y1 + (xq2 - x1) * (y2 - y1) / pmax(x2 - x1, 1e-12)
+  }
+
+  x <- df[[xcol]]; y <- df[[ycol]]
+  cls <- ifelse(
+    x <= x0, "PDL1-",
+    ifelse(y > y_on_curve(x), "PDL1+CC3+", "PDL1+CC3-")
+  )
+  factor(cls, levels = c("PDL1+CC3+", "PDL1+CC3-", "PDL1-"))
+}
+
+frnn7.cmb.tum$classification <- classify_pdl1_cc3(frnn7.cmb.tum)
+frnn7.cmb.mac$classification <- classify_pdl1_cc3(frnn7.cmb.mac)
+```
+
+### [Fig 6O, EDF10J] Neighboring T-cell Density by PD-L1/cCasp3 and pTBK1/gH2AX Classification
+
+Combines Tumor and Mac rows into one model per T-cell type, pooled across all samples/timepoints,
+using both the PDL1/CC3 and gH2AX/pTBK1 classifications defined above.
+
+```{r}
+classify_gh2ax_ptbk1 <- function(df, xcol = "gH2AX.log", ycol = "pTBK1.log", v = 0.06300655, h = -0.09366919) {
+  x <- df[[xcol]]; y <- df[[ycol]]
+  cls <- (x > v) + (y > h) * 2 + 1
+  factor(cls, levels = c(1,2,3,4),
+         labels = c("gH2AX-/pTBK1-","gH2AX+/pTBK1-","gH2AX-/pTBK1+","gH2AX+/pTBK1+"))
+}
+
+frnn7.cmb.tum$classification_ptbk <- classify_gh2ax_ptbk1(frnn7.cmb.tum)
+frnn7.cmb.mac$classification_ptbk <- classify_gh2ax_ptbk1(frnn7.cmb.mac)
+
+fit_neighboring_tcell_effect <- function(class_col, out_dir, out_prefix) {
+  # Explicit display order per classification scheme -- 4 Tumor then 4 Mac (or 3/3), and
+  # within each source, PDL1+CC3-/PDL1+CC3+/PDL1- or gH2AX+/pTBK1+, gH2AX-/pTBK1+,
+  # gH2AX+/pTBK1-, gH2AX-/pTBK1- -- rather than relying on interaction()'s default level
+  # ordering (alphabetical/factor-definition order, not this specific sequence).
+  classification_order <- list(
+    classification = c("PDL1+CC3-", "PDL1+CC3+", "PDL1-"),
+    classification_ptbk = c("gH2AX+/pTBK1+", "gH2AX-/pTBK1+", "gH2AX+/pTBK1-", "gH2AX-/pTBK1-")
+  )[[class_col]]
+  group_levels <- paste(
+    rep(c("Tumor", "Mac"), each = length(classification_order)),
+    rep(classification_order, times = 2),
+    sep = "_"
+  )
+
+  # Significance comparisons, all nominal p (adjust = "none", no FDR), shown as raw p-value
+  # text rather than stars:
+  # - Within each source (Tumor, Mac) separately: every pairwise combination among classes
+  #   (3 pairs for PDL1/CC3, 6 for gH2AX/pTBK1).
+  # - Cross-source: Tumor vs Mac for each class (3 or 4), stacked above the within-source
+  #   rows ("on top").
+  xpos <- setNames(seq_along(group_levels), group_levels)
+  within_source_pairs <- combn(classification_order, 2, simplify = FALSE)
+  n_cross_rows <- length(classification_order)
+
+  # Explicit bracket-height tiers (0 = lowest), keyed by local class position "i-j" within a
+  # source (1-based index into classification_order, sorted so i<j) -- adjacent pairs share
+  # the lowest tier, wider-spanning pairs stack above them so lines don't visually cross.
+  # PDL1/CC3 (3 classes): (1,2)/(2,3) low, (1,3) above.
+  # gH2AX/pTBK1 (4 classes): (2,3) lowest (own tier, since it's nested inside (2,4)); (1,2)/
+  # (2,4) next; (1,3)/(3,4) above that; (1,4) (full span, not explicitly specified) highest.
+  n_classes <- length(classification_order)
+  tier_map <- if (n_classes == 3) {
+    c("1-2" = 0, "2-3" = 0, "1-3" = 1)
+  } else if (n_classes == 4) {
+    c("2-3" = 0, "1-2" = 1, "2-4" = 1, "1-3" = 2, "3-4" = 2, "1-4" = 3)
+  } else {
+    stop("no explicit bracket-tier layout defined for ", n_classes, " classes")
+  }
+  n_within_rows <- max(tier_map) + 1
+
+  within_tier_of <- function(cl1, cl2) {
+    i <- match(cl1, classification_order)
+    j <- match(cl2, classification_order)
+    tier_map[[paste(sort(c(i, j)), collapse = "-")]]
+  }
+
+  # Two passes: build all 3 cell types' emm_df/contrasts first so a shared y-axis range
+  # (across CD8T/CD4T/T_other, for this protein pair) can be computed before any plot is
+  # drawn -- otherwise each of the 3 plots auto-scales independently and isn't comparable.
+  emm_dfs <- list()
+  sig_dfs <- list()
+  for (ct in c("CD8T", "CD4T", "T_other")) {
+    gr.n.ct <- bind_rows(
+      frnn7.cmb.tum %>%
+        transmute(sample, Patient.ID, source = "Tumor", classification = .data[[class_col]], ct_raw = .data[[ct]]),
+      frnn7.cmb.mac %>%
+        transmute(sample, Patient.ID, source = "Mac", classification = .data[[class_col]], ct_raw = .data[[ct]])
+    ) %>%
+      group_by(sample, Patient.ID, source, classification) %>%
+      summarise(mean_tcells = mean(ct_raw, na.rm = TRUE), .groups = "drop") %>%
+      mutate(
+        group = paste0(source, "_", classification),
+        Patient.ID = factor(Patient.ID)
+      )
+
+    fit <- lmer(mean_tcells ~ group + (1 | Patient.ID), data = gr.n.ct)
+    emm <- emmeans(fit, ~ group)
+    # tidyr::separate() (regex split via stringi/ICU) reproducibly triggered "vector memory
+    # exhausted" on this ~6-8-row table on at least one machine (tidyr 1.3.1/stringi 1.8.4) --
+    # a platform-specific stringi/ICU issue, not a real memory requirement. Splitting on the
+    # first "_" with base R sub() avoids stringi entirely and is equivalent to the original
+    # separate(group, into = c("source","classification"), sep = "_", extra = "merge").
+    emm_dfs[[ct]] <- as.data.frame(emm) %>%
+      mutate(
+        source = sub("_.*", "", group),
+        classification = sub("^[^_]+_", "", group),
+        group_label = factor(group, levels = group_levels)
+      ) %>%
+      dplyr::select(-group) %>%
+      mutate(source = factor(source, levels = c("Tumor", "Mac")))
+
+    grid_groups <- as.character(emm@grid$group)
+    contrast_vecs <- list()
+
+    # Within-source: every pairwise combination among classes, for each source separately.
+    for (src in c("Tumor", "Mac")) {
+      for (pr in within_source_pairs) {
+        name1 <- paste0(src, "_", pr[1])
+        name2 <- paste0(src, "_", pr[2])
+        vec <- setNames(rep(0, length(grid_groups)), grid_groups)
+        vec[name1] <- 1
+        vec[name2] <- -1
+        contrast_vecs[[paste(name1, name2, sep = " - ")]] <- vec
+      }
+    }
+    # Cross-source: Tumor vs Mac, for each class.
+    for (cl in classification_order) {
+      name1 <- paste0("Tumor_", cl)
+      name2 <- paste0("Mac_", cl)
+      vec <- setNames(rep(0, length(grid_groups)), grid_groups)
+      vec[name1] <- 1
+      vec[name2] <- -1
+      contrast_vecs[[paste(name1, name2, sep = " - ")]] <- vec
+    }
+
+    contrast_df <- as.data.frame(contrast(emm, method = contrast_vecs, adjust = "none"))
+    contrast_df$group1 <- sub(" - .+", "", contrast_df$contrast)
+    contrast_df$group2 <- sub(".+ - ", "", contrast_df$contrast)
+    contrast_df$source1 <- sub("_.*", "", contrast_df$group1)
+    contrast_df$source2 <- sub("_.*", "", contrast_df$group2)
+    contrast_df$is_cross_source <- contrast_df$source1 != contrast_df$source2
+
+    contrast_df <- contrast_df %>%
+      rowwise() %>%
+      mutate(
+        row_rank = if (is_cross_source) {
+          n_within_rows + match(sub("^Tumor_", "", group1), classification_order)
+        } else {
+          1 + within_tier_of(
+            sub("^(Tumor|Mac)_", "", group1),
+            sub("^(Tumor|Mac)_", "", group2)
+          )
+        }
+      ) %>%
+      ungroup() %>%
+      mutate(
+        x1_full = xpos[group1],
+        x2_full = xpos[group2],
+        # Shorten each segment by ~3% of its span (inset symmetrically), so brackets don't
+        # touch the data points/each other's endpoints directly.
+        x1 = x1_full + 0.015 * (x2_full - x1_full),
+        x2 = x2_full - 0.015 * (x2_full - x1_full),
+        # sprintf() formats each p-value independently (2 significant figures via "%.1e",
+        # e.g. "5.1e-04") -- unlike format(scientific=FALSE) on the whole vector, which pads
+        # every element to the widest element's decimal width, appending spurious trailing
+        # zeros to values that needed fewer digits.
+        label = sprintf("%.1e", p.value)
+      )
+
+    sig_dfs[[ct]] <- contrast_df
+  }
+
+  n_total_rows <- n_within_rows + n_cross_rows
+  ylim_data <- range(
+    unlist(lapply(emm_dfs, function(d) c(d$lower.CL, d$upper.CL))),
+    0 # keep the yintercept = 0 reference line visible on every plot
+  )
+  y_range <- diff(ylim_data)
+  bracket_step <- 0.08 * y_range
+  bracket_y0 <- ylim_data[2] + 0.06 * y_range
+  ylim_shared <- c(ylim_data[1], bracket_y0 + n_total_rows * bracket_step)
+
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+  for (ct in names(emm_dfs)) {
+    sig_df <- sig_dfs[[ct]] %>%
+      mutate(y = bracket_y0 + (row_rank - 1) * bracket_step)
+
+    p <- ggplot(emm_dfs[[ct]], aes(x = group_label, y = emmean)) +
+      geom_point(size = 2) +
+      geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+      geom_hline(yintercept = 0, linetype = 2, color = "grey60") +
+      geom_segment(data = sig_df, aes(x = x1, xend = x2, y = y, yend = y), inherit.aes = FALSE) +
+      geom_text(data = sig_df, aes(x = (x1 + x2) / 2, y = y, label = label), inherit.aes = FALSE, vjust = -0.3, size = 4) +
+      coord_cartesian(ylim = ylim_shared) +
+      xlab("") +
+      ylab("Effect size (emmean, T cells per CN)") +
+      labs(title = ct) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+    ggsave(file.path(out_dir, paste0(out_prefix, "_", ct, ".pdf")), p, width = 7, height = 6, units = "in", dpi = 300)
+  }
+}
+
+fit_neighboring_tcell_effect("classification", file.path(cycif_fig_dir, "spatial", "coexpression", "tcell_density_by_classification", "emmeans"), "emmeans_tcells_pdl1_cc3")
+fit_neighboring_tcell_effect("classification_ptbk", file.path(cycif_fig_dir, "spatial", "coexpression", "tcell_density_by_classification", "emmeans"), "emmeans_tcells_ptbk1_gh2ax")
+```
+
+### [Fig 6N left, EDF10I left] Tumor Marker Relationships
+
+#### PDL1 vs cCaspase3, in Tumor
+```{r}
+scatters <- list()
+for(ct in uniq.cts[4:6]){
+  scatters[[ct]] <- list()
+  frnn7.cmb.tum <- frnn7.cmb.tum %>%
+    mutate(ct_raw = !!sym(ct)) %>%
+    mutate(
+      density = {
+        ct_vals <- ct_raw
+        q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ct_vals, q[1]), q[2])
+      }
+    )
+
+  ab1 <- "PDL1.log"
+  ab2 <- "cCaspase3.log"
+  ab1s <- sub("\\.log","",ab1)
+  ab2s <- sub("\\.log","",ab2)
+  
+  coords <- as.matrix(frnn7.cmb.tum[c(ab1,ab2)])
+
+  knn <- get.knn(coords, k = 20)
+  
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  frnn7.cmb.tum$density <- apply(knn_indices, 1, function(idx) {
+    mean(frnn7.cmb.tum$density[idx], na.rm = TRUE)
+  })
+
+  p_main <- ggplot(frnn7.cmb.tum , aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) + #%>% arrange(density)
+    geom_point() + 
+    scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq",name = "mean\ndensity") +
+    theme_minimal() + 
+    theme(
+      axis.text = element_text(size = 28,color="black"),
+      axis.title = element_text(size = 32,color="black"),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1,color="black")
+    ) +
+    geom_vline(xintercept = bound_coords$vline$x, linetype="dashed",color="black",linewidth=1) +
+    geom_path(data = bound_coords$curve, aes(x = x, y = y), linetype="dashed",color="black",linewidth=1) +
+    xlab(paste0(ab1s," (log) in Tumor")) +
+    ylab(paste0(ab2s," (log) in Tumor")) +
+    plot_annotation(
+      title = ct,
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) 
+  
+  p_main <- p_main  + theme(legend.position="none") + common_scale(max_limit = 5)
+  scatters[[ct]]$PDL_CC3 <- p_main 
+  ggsave(file.path(cycif_fig_dir, "spatial", "coexpression", "tumor", paste0("scatter_",ab1s,"_",ab2s,"_",ct,".png")),
+     p_main, width = 7, height = 7, units = "in", dpi = 300)
+}
+```
+
+`boundaries2` is a manually-determined gH2AX/pTBK1 decision-boundary threshold, reused below
+for both the tumor and macrophage versions of this plot.
+```{r}
+boundaries2 <- list(v=c(0.06300655),h=c(-0.09366919))
+```
+
+#### gH2AX vs pTBK1, in Tumor
+```{r}
+scatters <- list()
+for(ct in uniq.cts[4:6]){
+  scatters[[ct]] <- list()
+  frnn7.cmb.tum <- frnn7.cmb.tum %>%
+    mutate(ct_raw = !!sym(ct)) %>%
+    mutate(
+      density = {
+        ct_vals <- ct_raw
+        q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ct_vals, q[1]), q[2])
+      }
+    )
+  
+  ab1 <- "gH2AX.log"
+  ab2 <- "pTBK1.log"
+  ab1s <- sub("\\.log","",ab1)
+  ab2s <- sub("\\.log","",ab2)
+  
+  coords <- as.matrix(frnn7.cmb.tum[c(ab1,ab2)])
+
+  knn <- get.knn(coords, k = 20)
+  
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  frnn7.cmb.tum$density <- apply(knn_indices, 1, function(idx) {
+    mean(frnn7.cmb.tum$density[idx], na.rm = TRUE)
+  })
+
+  p_full <- ggplot(frnn7.cmb.tum , aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) + #%>% arrange(density)
+    geom_point() + 
+    scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq",name = "mean\ndensity") +
+    theme_minimal() + 
+    theme(
+      axis.text = element_text(size = 28,color="black"),
+      axis.title = element_text(size = 32,color="black"),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1,color="black")
+    ) +
+    coord_cartesian(
+      xlim = rngs[[ab1]],
+      ylim = rngs[[ab2]]
+    ) +
+    geom_vline(xintercept = boundaries2$v, linetype="dashed",color="black",linewidth=1) +
+    geom_hline(yintercept = boundaries2$h, linetype="dashed",color="black",linewidth=1) +
+    xlab(paste0(ab1s," (log) in Tumor")) + 
+    ylab(paste0(ab2s," (log) in Tumor")) +
+    plot_annotation(
+      title = ct,
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) 
+  
+  p_main <- p_full  + theme(legend.position="none") + common_scale(max_limit = 3)
+  scatters[[ct]]$gH2AX1_pTBK1 <- p_main 
+  ggsave(file.path(cycif_fig_dir, "spatial", "coexpression", "tumor", paste0("scatter_",ab1s,"_",ab2s,"_",ct,".png")),
+     p_main, width = 7, height = 7, units = "in", dpi = 300)  
+}
+save_legend_pdf(p_full + common_scale(max_limit =3), file.path(cycif_fig_dir, "spatial", "coexpression", "tumor", "umap_gh2ax_ptbk1_legend.pdf"), width = 4, height = 6)
+
+```
+
+#### TME-level scatterplots by cell type / antibody
+```{r}
+ab_pairs <- list(
+  c("PDL1","PD1"),
+  c("PDL1","cCaspase3"),
+  c("gH2AX", "pTBK1")
+)
+
+scatters <- list()
+
+for (ct in uniq.cts[4:6]) {
+  scatters[[ct]] <- list()
+
+  for (pair in ab_pairs) {
+    ab1 <- pair[1]
+    ab2 <- pair[2]
+
+    xlab_text <- if (ab1 == "gH2AX") {
+      expression(gamma * "H2AX (CN)")
+    } else {
+      paste0(ab1, " (CN)")
+    }
+
+    dt.tme.1s <- dt.tme.1 %>%
+      mutate(ct_raw = !!sym(ct)) %>%
+      mutate(
+        density = {
+          ct_vals <- ct_raw
+          q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+          pmin(pmax(ct_vals, q[1]), q[2])
+        }
+      ) %>%
+      filter(gH2AX > -1 | pTBK1 > -1)
+
+    coords <- as.matrix(dt.tme.1s[c(ab1, ab2)])
+    knn <- get.knn(coords, k = 20)
+    knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+
+    dt.tme.1s$density <- apply(knn_indices, 1, function(idx) {
+      mean(dt.tme.1s$density[idx], na.rm = TRUE)
+    })
+
+    p_main <- ggplot(dt.tme.1s, aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) +
+      geom_point() +
+      scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq", name = "mean\ndensity") +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 28, color = "black"),
+        axis.title = element_text(size = 32, color = "black"),
+        legend.title = element_text(size = 20, margin = margin(b = 10)),
+        legend.text = element_text(size = 16),
+        legend.key.size = unit(1.2, "cm"),
+        legend.spacing.y = unit(1, "cm"),
+        legend.key.height = unit(1.2, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(size = 1, color = "black")
+      ) +
+      xlab(xlab_text) +
+      ylab(paste0(ab2, " (CN)")) +
+      plot_annotation(
+        title = ct,
+        theme = theme(
+          plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+          plot.background = element_blank()
+        )
+      ) + common_scale(0.42)
+
+    out_path <- file.path(
+      cycif_fig_dir, "spatial", "coexpression", "tme", "ct",
+      paste0("scatter_", ab1, "_", ab2, "_", ct, ".png")
+    )
+    ggsave(out_path, p_main + theme(legend.position = "none"), width = 7, height = 7, units = "in", dpi = 300)
+
+    scatters[[ct]][[paste0(ab1, "_", ab2)]] <- p_main
+  }
+}
+
+save_legend_pdf(
+  p_main,
+  file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ct", "scatter_celltype_legend.pdf"),
+  width = 4,
+  height = 6
+)
+
+for (ab in cst7.abs[c(2, 3, 4, 9, 10)]) {
+  scatters[[ab]] <- list()
+
+  for (pair in ab_pairs) {
+    ab1 <- pair[1]
+    ab2 <- pair[2]
+
+    xlab_text <- if (ab1 == "gH2AX") {
+      expression(gamma * "H2AX (CN)")
+    } else {
+      paste0(ab1, " (CN)")
+    }
+
+    dt.tme.1s <- dt.tme.1 %>%
+      mutate(ab_raw = .data[[ab]]) %>%
+      mutate(
+        density = {
+          ab_vals <- ab_raw
+          q <- quantile(ab_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+          pmin(pmax(ab_vals, q[1]), q[2])
+        }
+      ) %>%
+      filter(gH2AX > -1 | pTBK1 > -1)
+
+    coords <- as.matrix(dt.tme.1s[c(ab1, ab2)])
+    knn <- get.knn(coords, k = 20)
+    knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+
+    dt.tme.1s$density <- apply(knn_indices, 1, function(idx) {
+      mean(dt.tme.1s$density[idx], na.rm = TRUE)
+    })
+
+    p_main <- ggplot(dt.tme.1s, aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) +
+      geom_point() +
+      viridis::scale_color_viridis(guide = "none") +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 28, color = "black"),
+        axis.title = element_text(size = 32, color = "black"),
+        legend.title = element_text(size = 20, margin = margin(b = 10)),
+        legend.text = element_text(size = 16),
+        legend.key.size = unit(1.2, "cm"),
+        legend.spacing.y = unit(1, "cm"),
+        legend.key.height = unit(1.2, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(size = 1, color = "black")
+      ) +
+      xlab(xlab_text) +
+      ylab(paste0(ab2, " (CN)")) +
+      plot_annotation(
+        title = ab,
+        theme = theme(
+          plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+          plot.background = element_blank()
+        )
+      )
+
+    out_path <- file.path(
+      cycif_fig_dir, "spatial", "coexpression", "tme", "ab",
+      paste0("scatter_", ab1, "_", ab2, "_", ab, ".png")
+    )
+    ggsave(out_path, p_main, width = 7, height = 7, units = "in", dpi = 300)
+
+    scatters[[ab]][[paste0(ab1, "_", ab2)]] <- p_main
+  }
+}
+
+p_main <- ggplot(dt.tme.1s, aes(x = !!sym(ab1), y = !!sym(ab2), col = density)) +
+  geom_point() +
+  viridis::scale_color_viridis() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 20),
+    axis.title = element_text(size = 24),
+    legend.title = element_text(size = 20, margin = margin(b = 10)),
+    legend.text = element_text(size = 16),
+    legend.key.size = unit(1.2, "cm"),
+    legend.spacing.y = unit(1, "cm"),
+    legend.key.height = unit(1.2, "cm"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(size = 1)
+  ) +
+  xlab(paste0(ab1, " (log)")) +
+  ylab(paste0(ab2, " (log)")) +
+  plot_annotation(
+    title = ab,
+    theme = theme(
+      plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+      plot.background = element_blank()
+    )
+  )
+save_legend_pdf(
+  p_main,
+  file.path(cycif_fig_dir, "spatial", "coexpression", "tme", "ab", "scatter_ab_legend.pdf"),
+  width = 4,
+  height = 6
+)
+```
+
+## ---- Macrophage Spatial Analysis ----
+
+### [Fig 5H] Macrophage UMAP with Density of Each Cell Type
+
+```{r}
+for(ct in uniq.cts){
+  frnn7.cmb.mac <- frnn7.cmb.mac %>%
+    mutate(ct_raw = !!sym(ct)) %>%
+    mutate(
+      density = {
+        ct_vals <- ct_raw
+        q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ct_vals, q[1]), q[2])
+      }
+    )
+
+  coords <- as.matrix(frnn7.cmb.mac[, c("umap_x", "umap_y")])
+  
+  knn <- get.knn(coords, k = 20)
+  
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  frnn7.cmb.mac$density <- apply(knn_indices, 1, function(idx) {
+    mean(frnn7.cmb.mac$density[idx], na.rm = TRUE)
+  })
+  
+  p_main <- umap_base_num(frnn7.cmb.mac, aes(x = umap_x, y = umap_y, col = density)) + 
+    scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq",name = "mean\ndensity") +
+    umap_styling_1() +
+    plot_annotation(
+      title = ct,
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank()
+      )
+    ) + theme(legend.position = "none") + common_scale(max_limit=4)
+
+  if(ct == uniq.cts[1]){
+    p_full <- umap_base_num(frnn7.cmb.mac, aes(x = umap_x, y = umap_y, col = density)) +
+      umap_styling() +
+      scale_color_distiller(
+        palette = "YlGnBu",
+        limits = c(0,4),
+        direction = 1,
+        oob = scales::squish,
+        name = "Density"
+      )
+    save_legend_pdf(p_full, file.path(cycif_fig_dir, "umap", "mac", "ct_density", "umap_cts_legend_mac.pdf"), width = 4, height = 6)
+  }
+  ggsave(file.path(cycif_fig_dir, "umap", "mac", "ct_density", paste0("umap__x_",ct,"_v2.png")),
+     p_main, width = 7, height = 7, units = "in", dpi = 300)  
+}
+
+```
+
+### [Fig 5I, 5J, 5D] Macrophage Cluster Enrichment
+
+#### Enrichment heatmap
+
+Two enrichment tests here, both Fisher's exact, feeding two different outputs: `df_enrichment_p`
+tests whether each *neighboring* cell type (all of `uniq.cts`, not just the macrophage's own
+subtype label) is present among a macrophage's neighbors more than expected in each UMAP
+cluster -- `mat_plot`/`sig_labels` (full `uniq.cts` panel) from this test feed the barplots
+below. `mac_enrich_tbl` separately tests each macrophage subtype's own *frequency* within each
+cluster (the three subtypes' counts sum to the cluster's total macrophage count) -- its output
+(`mat_freq_enrich_t`, limited to the 3 macrophage subtype columns) is what the heatmap plots.
+```{r}
+dir.create(file.path(cycif_fig_dir, "umap", "mac", "enrichment"), recursive = TRUE, showWarnings = FALSE)
+
+df_long <- frnn7.cmb.mac %>%
+  dplyr::select(cluster, all_of(uniq.cts)) %>%
+  pivot_longer(-cluster, names_to = "cell_type", values_to = "cell_count") %>%
+  mutate(present = as.integer(cell_count > 0))
+
+df_enrichment_p <- df_long %>%
+  group_by(cell_type) %>%
+  group_modify(~{
+    d <- .x
+    map_dfr(unique(d$cluster), function(cl) {
+      d$in_cluster <- d$cluster == cl
+      tab <- table(d$present, d$in_cluster)
+
+      if (all(dim(tab) == c(2, 2))) {
+        ft <- fisher.test(tab, alternative = "greater")
+        odds <- ft$estimate
+        pval <- ft$p.value
+      } else {
+        odds <- NA
+        pval <- NA
+      }
+
+      tibble(
+        cluster = cl,
+        p_value = pval,
+        n_in = sum(d$in_cluster),
+        n_out = sum(!d$in_cluster),
+        effect_odds_ratio = odds
+      )
+    })
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"),
+         nlogp = -log10(p_value))
+
+df_sig <- df_enrichment_p %>%
+  mutate(nlogp = ifelse(p_adj < 0.05, nlogp, 0))
+
+mat_plot <- df_sig %>%
+  dplyr::select(cluster, cell_type, nlogp) %>%
+  pivot_wider(names_from = cell_type, values_from = nlogp) %>%
+  arrange(cluster) %>%
+  column_to_rownames("cluster") %>%
+  as.matrix()
+
+keep_cols <- intersect(uniq.cts, colnames(mat_plot))
+mat_plot <- mat_plot[, keep_cols, drop = FALSE]
+
+cap <- 200
+mat_plot <- pmax(pmin(mat_plot, cap), -cap)
+sig_labels <- ifelse(mat_plot > 50, "*", "")
+
+mac_freq_tbl <- frnn7.cmb.mac %>%
+  group_by(cluster, cell_types) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(cluster, cell_types, fill = list(n = 0))
+
+tot_cluster_mac <- mac_freq_tbl %>% group_by(cluster) %>% summarise(n_cluster = sum(n), .groups = "drop")
+tot_type_mac    <- mac_freq_tbl %>% group_by(cell_types) %>% summarise(n_type = sum(n), .groups = "drop")
+N_total_mac     <- sum(mac_freq_tbl$n)
+
+mac_enrich_tbl <- mac_freq_tbl %>%
+  left_join(tot_cluster_mac, by = "cluster") %>%
+  left_join(tot_type_mac,    by = "cell_types") %>%
+  mutate(
+    a = n,
+    b = n_cluster - a,
+    c = n_type - a,
+    d = N_total_mac - a - b - c
+  ) %>%
+  rowwise() %>%
+  mutate(
+    ft = list(fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE),
+                          alternative = "greater")),
+    p_greater = ft$p.value
+  ) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_greater, method = "BH"),
+         nlogp = -log10(p_greater))
+
+mac_enrich_sig <- mac_enrich_tbl %>%
+  mutate(nlogp = ifelse(p_adj < 0.05, nlogp, 0),
+         nlogp = pmin(nlogp, 200))
+
+mat_freq_enrich <- mac_enrich_sig %>%
+  dplyr::select(cluster, cell_types, nlogp) %>%
+  pivot_wider(names_from = cell_types, values_from = nlogp) %>%
+  arrange(cluster) %>%
+  column_to_rownames("cluster") %>%
+  as.matrix()
+
+mac_cols <- intersect(c("Mac_CD68", "Mac_CD163", "Mac_CD68_CD163"), colnames(mat_freq_enrich))
+mat_freq_enrich <- mat_freq_enrich[, mac_cols, drop = FALSE]
+sig_labels_freq <- ifelse(mat_freq_enrich > 50, "*", "")
+
+mat_freq_enrich_t <- t(mat_freq_enrich)
+sig_labels_freq_t <- t(sig_labels_freq)
+
+col_fun <- colorRamp2(c(0, 200), c("white", brewer.pal(9,"Reds")[7]))
+
+pdf(file.path(cycif_fig_dir, "umap", "mac", "enrichment", "heatmap_mac_enrichment_cell_types.pdf"),
+    width = 7, height = 2.5)
+Heatmap(
+  mat_freq_enrich_t,
+  name = "-log10(FDR)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  heatmap_legend_param = list(
+    title = expression(-log[10]~FDR),
+    at = seq(0, 200, length = 5),
+    labels = as.character(seq(0, 200, length = 5))
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_labels_freq_t[i, j] != "") {
+      grid.text(sig_labels_freq_t[i, j], x, y,
+                gp = gpar(fontsize = 20, fontface = "bold"))
+    }
+  },
+  column_title = "Macrophage subtype enrichment by cluster"
+)
+dev.off()
+
+```
+
+#### Cell types enriched near Mac_1 / Mac_2
+```{r}
+mat1_df <- as.data.frame(t(mat_plot["Mac_1", , drop = FALSE])) %>%
+  rownames_to_column("cluster") %>%
+  rename(value = Mac_1) %>%
+  arrange(desc(value))
+mat1_df$cluster <- factor(mat1_df$cluster, levels = mat1_df$cluster)
+
+p1 <- ggplot(mat1_df, aes(x = cluster, y = value)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = -log10(0.05), color = 2) +
+  annotate("text", x = Inf, y = -log10(0.05), label = "p-adj=0.05",
+           color = 2, hjust = 1, vjust = -0.5, size = 6) +
+  labs(x = NULL, y = "Mac_1 abundance (-log10(p))") +
+  theme_minimal() +
+  ggtitle("Cell types enriched near Mac_1") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 16),
+    axis.title.y = element_text(size = 16)
+  )
+
+mat2_df <- as.data.frame(t(mat_plot["Mac_2", , drop = FALSE])) %>%
+  rownames_to_column("cluster") %>%
+  rename(value = Mac_2) %>%
+  arrange(desc(value))
+mat2_df$cluster <- factor(mat2_df$cluster, levels = mat2_df$cluster)
+
+p2 <- ggplot(mat2_df, aes(x = cluster, y = value)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = -log10(0.05), color = 2) +
+  annotate("text", x = Inf, y = -log10(0.05), label = "p-adj=0.05",
+           color = 2, hjust = 1, vjust = -0.5, size = 6) +
+  labs(x = NULL, y = "Mac_2 abundance (-log10(p))") +
+  theme_minimal() +
+  ggtitle("Cell types enriched near Mac_2") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 16),
+    axis.title.y = element_text(size = 16)
+  )
+
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "enrichment", "barplot_cts_abundance_mac1.pdf"), p1,
+       width = 6, height = 6, dpi = 300)
+
+ggsave(file.path(cycif_fig_dir, "umap", "mac", "enrichment", "barplot_cts_abundance_mac2.pdf"), p2,
+       width = 6, height = 6, dpi = 300)
+```
+
+
+### [Fig 6N right, EDF10I right] Macrophage Marker Relationships
+
+#### PDL1 vs cCaspase3, in Macrophages
+```{r}
+scatters1 <- list()
+for(ct in uniq.cts[4:6]){
+  scatters1[[ct]] <- list()
+  frnn7.cmb.mac <- frnn7.cmb.mac %>%
+    mutate(ct_raw = !!sym(ct)) %>%
+    mutate(
+      density = {
+        ct_vals <- ct_raw
+        q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ct_vals, q[1]), q[2])
+      }
+    )
+
+  ab1 <- "PDL1.log"
+  ab2 <- "cCaspase3.log"
+  ab1s <- sub("\\.log","",ab1)
+  ab2s <- sub("\\.log","",ab2)
+  
+  coords <- as.matrix(frnn7.cmb.mac[c(ab1,ab2)])
+
+  knn <- get.knn(coords, k = 20)
+  
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  frnn7.cmb.mac$density <- apply(knn_indices, 1, function(idx) {
+    mean(frnn7.cmb.mac$density[idx], na.rm = TRUE)
+  })
+
+  p_main <- ggplot(frnn7.cmb.mac , aes(x = !!sym(ab1), y = !!sym(ab2), col = density)) +
+    geom_point() + 
+    scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq",name = "mean\ndensity") +
+    theme_minimal() + 
+    theme(
+      axis.text = element_text(size = 28,color="black"),
+      axis.title = element_text(size = 32,color="black"),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1,color="black")
+    ) +
+    geom_vline(xintercept = bound_coords$vline$x, linetype="dashed",color="black",linewidth=1) +
+    geom_path(data = bound_coords$curve, aes(x = x, y = y), linetype="dashed",color="black",linewidth=1) +    
+    xlab(paste0(ab1s," (log) in Mac")) + 
+    ylab(paste0(ab2s," (log) in Mac")) +
+    plot_annotation(
+      title = ct,
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) 
+  p_main <- p_main  + theme(legend.position="none") + common_scale(max_limit = 5)
+  scatters1[[ct]]$PDL_CC3 <- p_main 
+  ggsave(file.path(cycif_fig_dir, "spatial", "coexpression", "mac", paste0("scatter_",ab1s,"_",ab2s,"_",ct,".png")),
+     p_main, width = 7, height = 7, units = "in", dpi = 300)
+}
+```
+
+#### gH2AX vs pTBK1, in Macrophages
+```{r}
+scatters1 <- list()
+for(ct in uniq.cts[4:6]){
+  scatters1[[ct]] <- list()
+  frnn7.cmb.mac <- frnn7.cmb.mac %>%
+    mutate(ct_raw = !!sym(ct)) %>%
+    mutate(
+      density = {
+        ct_vals <- ct_raw
+        q <- quantile(ct_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+        pmin(pmax(ct_vals, q[1]), q[2])
+      }
+    )
+
+  ab1 <- "gH2AX.log"
+  ab2 <- "pTBK1.log"
+  ab1s <- sub("\\.log","",ab1)
+  ab2s <- sub("\\.log","",ab2)
+  
+  coords <- as.matrix(frnn7.cmb.mac[c(ab1,ab2)])
+
+  knn <- get.knn(coords, k = 20)
+  
+  knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+  
+  frnn7.cmb.mac$density <- apply(knn_indices, 1, function(idx) {
+    mean(frnn7.cmb.mac$density[idx], na.rm = TRUE)
+  })
+
+  p_main <- ggplot(frnn7.cmb.mac , aes(x = .data[[ab1]], y = .data[[ab2]], col = density)) +
+    geom_point() + 
+    scale_color_distiller(palette = "YlGnBu", direction = 1, type = "seq",name = "mean\ndensity") +
+    theme_minimal() + 
+    theme(
+      axis.text = element_text(size = 28,color="black"),
+      axis.title = element_text(size = 32,color="black"),
+      legend.title = element_text(size = 20, margin = margin(b = 10)),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.2, "cm"),
+      legend.spacing.y = unit(1, "cm"),
+      legend.key.height = unit(1.2, "cm"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(size=1,color="black")
+    ) +
+    coord_cartesian(
+      xlim = rngs[[ab1]],
+      ylim = rngs[[ab2]]
+    ) +
+    geom_vline(xintercept = boundaries2$v, linetype="dashed",color="black",linewidth=1) +
+    geom_hline(yintercept = boundaries2$h, linetype="dashed",color="black",linewidth=1) +
+    xlab(paste0(ab1s," (log) in Mac")) + 
+    ylab(paste0(ab2s," (log) in Mac")) +
+    plot_annotation(
+      title = ct,
+      theme = theme(
+        plot.title = element_text(size = 50, hjust = 0.5, margin = margin(b = 20)),
+        plot.background = element_blank()
+      )
+    ) 
+  p_main <- p_main  + theme(legend.position="none") + common_scale(max_limit = 5)
+  scatters1[[ct]]$gH2AX_pTBK1 <- p_main 
+  ggsave(file.path(cycif_fig_dir, "spatial", "coexpression", "mac", paste0("scatter_",ab1s,"_",ab2s,"_",ct,".png")),
+     p_main, width = 7, height = 7, units = "in", dpi = 300)
+}
+```
+
+#### Base-R version (last cell type from the loop above, for a custom density-color legend)
+```{r}
+pal_fun <- colorRampPalette(RColorBrewer::brewer.pal(9, "YlGnBu"))
+col_vec <- pal_fun(100)
+
+density_scaled <- frnn7.cmb.mac$density
+density_scaled <- (density_scaled - min(density_scaled, na.rm = TRUE)) /
+                  (max(density_scaled, na.rm = TRUE) - min(density_scaled, na.rm = TRUE))
+
+col_idx <- pmax(1, pmin(100, round(density_scaled * 100)))
+pt_cols <- col_vec[col_idx]
+
+plot(
+  frnn7.cmb.mac[[ab1]], frnn7.cmb.mac[[ab2]],
+  col = pt_cols, pch = 16, cex = 0.8,
+  xlab = paste0(ab1s, " (log) in Mac"),
+  ylab = paste0(ab2s, " (log) in Mac"),
+  main = ct,
+  cex.lab = 1.6,
+  cex.axis = 1.3,
+  cex.main = 2.2,
+  las = 1
+)
+
+usr <- par("usr")
+legend_x <- usr[2] + (usr[2] - usr[1]) * 0.02
+legend_y <- seq(usr[3], usr[4], length.out = 100)
+
+par(xpd = TRUE)
+rect(
+  xleft = legend_x,
+  ybottom = legend_y[-100],
+  xright = legend_x + (usr[2]-usr[1])*0.03,
+  ytop = legend_y[-1],
+  col = col_vec,
+  border = NA
+)
+
+text(legend_x + (usr[2]-usr[1])*0.05, legend_y[1], "High\nDensity",
+     adj = 0, cex = 1.2)
+text(legend_x + (usr[2]-usr[1])*0.05, legend_y[100], "Low\nDensity",
+     adj = 0, cex = 1.2)
+par(xpd = FALSE)
+
+```
+## ---- T-Cell Spatial Analysis ----
+
+### Define T-Cell Spatial Inputs
+```{r}
+frnn7.cmb.cd8t <- frnn7.cmb %>% 
+  filter(cell_types %in% "CD8T") %>% 
+  mutate(across(all_of(uniq.cts), as.numeric))
+
+frnn7.cmb.cd4t <- frnn7.cmb %>% 
+  filter(cell_types %in% "CD4T") %>% 
+  mutate(across(all_of(uniq.cts), as.numeric))
+
+frnn7.cmb.t_other <- frnn7.cmb %>% 
+  filter(cell_types %in% "T_other") %>% 
+  mutate(across(all_of(uniq.cts), as.numeric))
+```
+
+#### [EDF9G] Frequency of T Cell-Rich Clusters
+
+`n` = total neighboring-cell count per row.
+```{r}
+n <- rowSums(as.matrix(frnn7.cmb[, uniq.cts]))
+
+df_plot <- frnn7.cmb %>%
+  filter(n >= 10 & is.sele.7) %>%
+  mutate(across(all_of(uniq.cts), as.numeric)) %>%
+  mutate(
+    across(all_of(uniq.cts), ~ .x + runif(length(.x), min = -0.2, max = 0.2)),
+    across(all_of(uniq.cts), ~ pmax(.x, 0))
+  ) %>%
+  rowwise() %>%
+  mutate(
+    total_cells = sum(c_across(all_of(uniq.cts)), na.rm = TRUE),
+    CD8T_freq   = ifelse(total_cells > 0, CD8T / total_cells, 0),
+    CD4T_freq   = ifelse(total_cells > 0, CD4T / total_cells, 0),
+    Tother_freq = ifelse(total_cells > 0, T_other / total_cells, 0)
+  ) %>%
+  ungroup()
+
+df_bar <- df_plot %>%
+  group_by(cluster) %>%
+  summarise(
+    CD8T = mean(CD8T_freq, na.rm = TRUE),
+    CD4T = mean(CD4T_freq, na.rm = TRUE),
+    T_other = mean(Tother_freq, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = c(CD8T, CD4T, T_other),
+               names_to = "CellType", values_to = "Frequency") %>%
+  ungroup()
+
+df_bar <- df_bar %>%
+  mutate(cluster = factor(cluster, levels = unique(cluster)),
+         CellType = factor(CellType, levels = rev(c("CD8T", "CD4T", "T_other"))))
+
+p_bar <- ggplot(df_bar, aes(x = cluster, y = Frequency, fill = CellType)) +
+  geom_bar(stat = "identity", width = 0.8, color = "black", size = 0.2) +
+  scale_fill_manual(values = ct.cols7[c("CD8T", "CD4T", "T_other")]) +
+  labs(
+    x = "",
+    y = "Mean Frequency (fraction of all cells)",
+    fill = "Cell Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 12, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, color = "black"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "tcell_freq_by_tme_cluster.pdf"),
+       p_bar, width = 5, height = 6, units = "in", dpi = 300)
+```
+
+### [Fig 4K, 4J] T-Cell Density and Colocalization
+
+#### PD1 vs neighboring T-cell density, per center/neighbor pair
+```{r}
+datasets <- list(
+  CD8T   = frnn7.cmb.cd8t %>% filter(!is.na(cluster)),
+  CD4T   = frnn7.cmb.cd4t %>% filter(!is.na(cluster)),
+  T_other = frnn7.cmb.t_other %>% filter(!is.na(cluster))
+)
+
+cell_types <- c("CD8T", "CD4T", "T_other")
+
+df <- bind_rows(lapply(names(datasets), function(obj_name) {
+  obj <- datasets[[obj_name]]
+  
+  bind_rows(lapply(cell_types, function(ct) {
+    x1 <- obj$PD1.log
+    y1 <- obj[[ct]]
+    cl <- obj$cluster
+    
+    if (obj_name == ct) {
+      y1 <- y1 - 1
+    }
+    
+    keep <- is.finite(x1) & is.finite(y1)
+    
+    data.frame(
+      center = obj_name,
+      neighbor = ct,
+      PD1 = x1[keep],
+      density = y1[keep],
+      cluster = cl[keep]
+    )
+  }))
+})) %>%
+  mutate(
+    center = factor(center, levels = c("CD8T", "CD4T", "T_other")),
+    neighbor = factor(neighbor, levels = c("CD8T", "CD4T", "T_other"))
+  )
+
+stats_df <- df %>%
+  group_by(center, neighbor) %>%
+  summarize(
+    slope = {
+      fit <- try(lm(PD1 ~ density), silent = TRUE)
+      if (inherits(fit, "try-error") || any(is.na(coef(fit)))) NA_real_
+      else unname(coef(fit)[2])
+    },
+    r2 = {
+      fit <- try(lm(PD1 ~ density), silent = TRUE)
+      if (inherits(fit, "try-error") || any(is.na(coef(fit)))) NA_real_
+      else summary(fit)$r.squared
+    },
+    pval = {
+      fit <- try(lm(PD1 ~ density), silent = TRUE)
+      if (inherits(fit, "try-error") || any(is.na(coef(fit)))) NA_real_
+      else summary(fit)$coefficients[2, 4]
+    },
+    .groups = "drop"
+  )
+
+
+df_density <- df %>%
+  group_by(center, neighbor) %>%
+  mutate(
+    ok = is.finite(PD1) & is.finite(density),
+    density_col = NA_character_,
+    density_col = replace(
+      density_col, ok,
+      grDevices::densCols(
+        density[ok], PD1[ok],
+        colramp = colorRampPalette(viridisLite::magma(256))
+      )
+    )
+  ) %>%
+  ungroup()
+
+p_density <- ggplot(df_density, aes(density, PD1, colour = density_col)) +
+  geom_point(size = .5) +
+  scale_colour_identity() +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 0.8) +
+  facet_grid(center ~ neighbor, switch = "y") +
+  geom_text(
+    data = stats_df,
+    aes(
+      x = Inf, y = -Inf,
+      label = sprintf("R² = %.2f\np = %.3g\nslope = %.3f", r2, pval,slope)
+    ),
+    hjust = 1.1, vjust = -0.2, size = 4,
+    inherit.aes = FALSE
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.x = element_text(size = 12),
+    strip.text.y.left = element_text(angle = 90, size = 12),
+    plot.title = element_text(size = 14, hjust = 0.5),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Density (neighboring T cells/CN)",
+    y = "PD1 expression in center of CN"
+  )
+
+ggsave(
+  file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "correlation_tcell_pd1_density_v5.pdf"),
+  p_density, width = 7, height = 7
+)
+```
+
+#### Spatial co-occurrence heatmap across cell types
+```{r}
+df.cts <- frnn7.cmb %>%
+  filter(n >= 10 & is.sele.7) %>%
+  dplyr::select(all_of(uniq.cts)) %>%
+  as.data.frame()
+
+mat.cts <- as.matrix(df.cts)
+
+row_sums <- rowSums(mat.cts, na.rm = TRUE)
+mat.freq <- sweep(mat.cts, 1, row_sums, FUN = "/")
+mat.freq[!is.finite(mat.freq)] <- 0
+
+sp <- cor(mat.freq, method = "spearman", use = "pairwise.complete.obs")
+sp_df <- as.matrix(sp)
+
+mat_sig <- sp_df > 0.25
+diag(mat_sig) <- FALSE
+mat_sig[is.na(mat_sig)] <- FALSE
+
+pdf(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "heatmap_spearman_correlation_celltypes.pdf"),
+    width = 6.5, height = 6)
+
+ht <- Heatmap(
+  sp_df,
+  name = "cell type colocalization",
+  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = TRUE,
+  show_column_dend = TRUE,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  heatmap_legend_param = list(
+    title = "Spearman",
+    at = seq(-1, 1, length.out = 5),
+    labels = as.character(seq(-1, 1, length.out = 5))
+  ),
+  column_title = "Spatial co-occurrence of cell types",
+  rect_gp = gpar(col = NA),
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    if (mat_sig[i, j]) {
+      grid.rect(
+        x = x, y = y, width = w, height = h,
+        gp = gpar(fill = NA, col = "black", lwd = 1.5)
+      )
+    }
+  }
+)
+
+ComplexHeatmap::draw(ht, heatmap_legend_side = "right")
+dev.off()
+  
+```
+
+### Partial-residual grid function, feeds [EDF6E] below
+
+For a chosen focus density, nets out the *other two* densities' fitted contribution from PD1
+(using that bt3 group's own coefficients), then plots the residual against the focus density --
+the slope of that residual scatter is the focus density's *adjusted* effect, net of the other
+two. Built from `frnn7.cmb` directly (same source as `df1`), using all available cells per bt3
+group rather than the 500-capped balanced sample -- the balancing only mattered for the single
+pooled brms fit, not for separate per-group regressions.
+
+```{r}
+## coefs: bt3 x term coefficient table used to net out the two non-focus terms.
+build_partial_residual_grid <- function(fit_result, center_type, coefs) {
+  df_full <- fit_result$df_full
+  terms <- c("CD8T", "CD4T", "T_other")
+
+  grid_df <- purrr::map_dfr(terms, function(focus_term) {
+    other_terms <- setdiff(terms, focus_term)
+    df_full %>%
+      left_join(
+        coefs %>% filter(term %in% other_terms) %>%
+          dplyr::select(bt3, term, slope) %>%
+          pivot_wider(names_from = term, values_from = slope, names_prefix = "b_"),
+        by = "bt3"
+      ) %>%
+      mutate(
+        PD1_adj = PD1 - .data[[paste0("b_", other_terms[1])]] * .data[[other_terms[1]]] -
+                        .data[[paste0("b_", other_terms[2])]] * .data[[other_terms[2]]],
+        focus_density = .data[[focus_term]],
+        focus_term = focus_term
+      ) %>%
+      dplyr::select(bt3, focus_term, focus_density, PD1_adj)
+  }) %>%
+    mutate(focus_term = factor(focus_term, levels = terms))
+
+  ann_df <- coefs %>%
+    rename(focus_term = term) %>%
+    mutate(focus_term = factor(focus_term, levels = terms))
+
+  p <- ggplot(grid_df, aes(focus_density, PD1_adj)) +
+    geom_point(size = 0.4, alpha = 0.4) +
+    geom_smooth(method = "lm", se = TRUE, color = "red", fill = "red", alpha = 0.15, linewidth = 0.8) +
+    facet_grid(focus_term ~ bt3, switch = "y") +
+    ## Two single-line layers (not one multi-line label) so both lines' right edges align.
+    geom_text(
+      data = ann_df,
+      aes(x = Inf, y = -Inf, label = sprintf("slope = %.3f", slope)),
+      hjust = 1.1, vjust = -1.6, size = 3.5, inherit.aes = FALSE
+    ) +
+    geom_text(
+      data = ann_df,
+      aes(x = Inf, y = -Inf, label = sprintf("95%% CrI [%.3f, %.3f]", ci_low, ci_high)),
+      hjust = 1.1, vjust = -0.2, size = 3.5, inherit.aes = FALSE
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text.x = element_text(size = 12),
+      strip.text.y.left = element_text(angle = 90, size = 12),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 14),
+      legend.position = "none"
+    ) +
+    labs(x = "Density", y = paste0("PD-1 in ", center_type, "+ T (partial residual)"),
+         title = paste0("PD1 in ", center_type, " ~ density, adjusted (partial residual), by bt3"))
+
+  list(grid_df = grid_df, plot = p)
+}
+```
+
+### Hierarchical (partial-pooling) alternative: brms with bt3 as a random-slope grouping factor, instead of six separate unpooled lmer fits per center
+
+The `mv_fits`/`stats_df` pipeline above treats each bt3 group's coefficients as fully
+independent -- WT_BX3's estimate reflects only its own 218 cells, with no borrowing of
+strength from the other five groups, which is why its uncertainty dwarfs the others. This
+fits one brms model per center (same structure as the primary `fit_full` model, just scoped
+to one center's cells) with `bt3` as a random-slope grouping factor, then extracts each
+bt3 group's *shrunk* coefficient via `coef()` -- population fixed effect + that group's
+partially-pooled deviation, pulled toward the mean in proportion to how little data
+supports it. Feeds the same slope-vs-mean-CD4T-density meta-regression as before.
+
+```{r}
+if(0){
+  fit_hier_by_center <- function(center_type) {
+    df_full <- frnn7.cmb %>%
+      mutate(bt3 = factor(paste0(BRCA, "_", TimePoint),
+                           levels = c("MUT_BS","MUT_BX2","MUT_BX3","WT_BS","WT_BX2","WT_BX3"))) %>%
+      filter(n >= 10 & is.sele.7) %>%
+      filter(cell_types == center_type) %>%
+      dplyr::select(PD1, CD8T, CD4T, T_other, Patient.ID, bt3)
+  
+    if ("package:org.Hs.eg.db" %in% search()) detach("package:org.Hs.eg.db", unload = TRUE)
+  
+    fit <- brm(
+      PD1 ~ CD8T + CD4T + T_other + (1 + CD8T + CD4T + T_other || bt3) + (1 | Patient.ID),
+      data = df_full, family = student(), iter = 4000, chains = 4, cores = 4, seed = 123
+    )
+  
+    list(df_full = df_full, fit = fit)
+  }
+  
+  ## Fitting three Bayesian models -- this will take a while, same order of magnitude as fit_full earlier.
+  hier.CD4 <- fit_hier_by_center("CD4T")
+  hier.CD8 <- fit_hier_by_center("CD8T")
+  hier.T_other <- fit_hier_by_center("T_other")
+  save(hier.CD4, hier.CD8, hier.T_other, file = file.path(cycif_obj_dir, "cycif7_tcell_density_bayesian_fits.rda"))
+}else{
+  load(file.path(cycif_obj_dir,"cycif7_tcell_density_bayesian_fits.rda")) # hier.CD4, hier.CD8, hier.T_other
+}
+```
+
+##### Convergence Check
+```{r}
+cat("CD4T-center model, max Rhat:", max(brms::rhat(hier.CD4$fit), na.rm = TRUE), "\n")
+cat("CD8T-center model, max Rhat:", max(brms::rhat(hier.CD8$fit), na.rm = TRUE), "\n")
+cat("T_other-center model, max Rhat:", max(brms::rhat(hier.T_other$fit), na.rm = TRUE), "\n")
+
+np.CD4 <- brms::nuts_params(hier.CD4$fit)
+np.CD8 <- brms::nuts_params(hier.CD8$fit)
+np.T_other <- brms::nuts_params(hier.T_other$fit)
+cat("CD4T-center divergences:", sum(np.CD4$Value[np.CD4$Parameter == "divergent__"]),
+    "out of", brms::ndraws(hier.CD4$fit), "\n")
+cat("CD8T-center divergences:", sum(np.CD8$Value[np.CD8$Parameter == "divergent__"]),
+    "out of", brms::ndraws(hier.CD8$fit), "\n")
+cat("T_other-center divergences:", sum(np.T_other$Value[np.T_other$Parameter == "divergent__"]),
+    "out of", brms::ndraws(hier.T_other$fit), "\n")
+```
+
+Extracts each bt3 group's shrunk coefficient for each density term.
+```{r}
+extract_bt3_coefs <- function(fit_result, center_type) {
+  cf <- coef(fit_result$fit)$bt3[, , c("CD8T", "CD4T", "T_other")]
+  purrr::map_dfr(c("CD8T", "CD4T", "T_other"), function(term) {
+    as.data.frame(cf[, , term]) %>%
+      rownames_to_column("bt3") %>%
+      mutate(term = term)
+  }) %>%
+    rename(slope = Estimate, ci_low = Q2.5, ci_high = Q97.5) %>%
+    mutate(center = center_type)
+}
+
+hier_coefs.CD4 <- extract_bt3_coefs(hier.CD4, "CD4T")
+hier_coefs.CD8 <- extract_bt3_coefs(hier.CD8, "CD8T")
+hier_coefs.T_other <- extract_bt3_coefs(hier.T_other, "T_other")
+```
+
+### [EDF6E] Partial-residual grid, CD8T center, adjustment from the brm() hierarchical fit
+
+For CD8T-center cells, nets out the other two densities' fitted contribution from PD1 using
+`hier_coefs.CD8` (the brm() hierarchical fit's shrunk per-bt3 estimates), then plots the
+residual against each focus density, individual points + red regression line, faceted bt3 x
+term.
+
+```{r}
+grid.CD8.hier <- build_partial_residual_grid(hier.CD8, "CD8T", coefs = hier_coefs.CD8)
+grid.CD8.hier$plot
+ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "correlation_tcell_pd1-cd8t_density_by_bt3_hier.pdf"),
+       grid.CD8.hier$plot, width = 11, height = 6, units = "in", dpi = 300)
+```
+
+### [EDF6F] Boxplot: shrunk slopes across bt3, for PD1 in CD4T/CD8T ~ CD4T/CD8T density
+
+Direct visualization of the finding this whole exploration converged on: the shrunk (hierarchical,
+partially-pooled) per-bt3 slope for each of the four center x focus-density combinations,
+boxplotted across the six bt3 groups with each group's own point and label shown -- CD4T-density's
+slope should be visibly consistent across bt3 (tight box), while CD8T-density's varies a lot more
+(wide box). `facet_wrap(~ center)`, each panel: paired Wilcoxon signed-rank tests (paired by
+bt3) comparing the three neighbor terms pairwise, brackets/p-values overlaid.
+
+```{r}
+slope_box_df <- bind_rows(hier_coefs.CD4, hier_coefs.CD8, hier_coefs.T_other) %>%
+  mutate(
+    center = factor(center, levels = c("CD4T", "CD8T", "T_other")),
+    term   = factor(term,   levels = c("CD4T", "CD8T", "T_other"))
+  )
+
+comparisons <- list(c("CD4T", "CD8T"), c("CD4T", "T_other"), c("CD8T", "T_other"))
+
+wilcox_df <- slope_box_df %>%
+  group_by(center) %>%
+  group_modify(~ {
+    map_dfr(comparisons, function(comp) {
+      d <- .x %>% dplyr::select(bt3, term, slope) %>%
+        pivot_wider(names_from = term, values_from = slope)
+      w <- try(suppressWarnings(wilcox.test(d[[comp[1]]], d[[comp[2]]], paired = TRUE)), silent = TRUE)
+      tibble(term1 = comp[1], term2 = comp[2],
+             pval = if (inherits(w, "try-error")) NA_real_ else w$p.value)
+    })
+  }) %>%
+  ungroup() %>%
+  mutate(label = ifelse(is.na(pval), "", paste0("p=", signif(pval, 2))))
+
+term_levels <- c("CD4T", "CD8T", "T_other")
+x_pos <- setNames(seq_along(term_levels), term_levels)
+y_base <- max(slope_box_df$slope, na.rm = TRUE)
+y_offsets <- c("CD4T_CD8T" = y_base * 1.10, "CD8T_T_other" = y_base * 1.10,
+               "CD4T_T_other" = y_base * 1.22)
+
+ann_df <- wilcox_df %>%
+  mutate(
+    x1 = x_pos[term1] + 0.05,
+    x2 = x_pos[term2] - 0.05,
+    xmid = (x1 + x2) / 2,
+    contrast = paste(term1, term2, sep = "_"),
+    y = y_offsets[contrast]
+  )
+
+p_slope_box <- ggplot(slope_box_df, aes(term, slope)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey50") +
+  geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.3, color = "black") +
+  geom_line(aes(group = bt3), color = "grey60", linewidth = 0.5) +
+  geom_point(aes(color = bt3), size = 2.5) +
+  geom_segment(data = ann_df, aes(x = x1, xend = x2, y = y, yend = y),
+               inherit.aes = FALSE, color = "black", linewidth = 0.4) +
+  geom_text(data = ann_df, aes(x = xmid, y = y * 1.02, label = label),
+            inherit.aes = FALSE, size = 4, vjust = 0) +
+  facet_wrap(~ center, nrow = 1) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_bw(base_size = 14) +
+  labs(x = "Neighboring T-cell type", y = "Slope", color = "bt3",
+       title = "PD1 ~ density slope by bt3") +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+p_slope_box
+
+ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "slope_boxplot_by_bt3_3x3.pdf"),
+       p_slope_box, width = 8, height = 6, dpi = 300)
+```
+
+### Mean CD4T / CD8T density per sample, by BRCA x TimePoint (plot_ct)
+
+Explains what's driving the x-axis position in every meta-regression panel above: the actual
+per-patient mean density values underlying "mean CD4T/CD8T density" per bt3 group, plotted with
+the project's standard `plot_ct()` framework (per-patient trajectories across bt3, paired
+LMER + emmeans contrasts). Density averaged across all QC-passing T cells per sample (not restricted to one center
+type), matching the existing QC filters used throughout. Self-density only: CD4T density
+among CD4T cells, CD8T density among CD8T cells.
+
+```{r}
+if (!exists("pt.cols")) pt.cols <- load_pt_colors()
+
+mean_cd4t_density_by_sample <- frnn7.cmb %>%
+  filter(n >= 10 & is.sele.7) %>%
+  filter(cell_types == "CD4T") %>%
+  group_by(sample) %>%
+  summarize(mean_CD4T_density = mean(CD4T, na.rm = TRUE), .groups = "drop")
+
+mean_cd8t_density_by_sample <- frnn7.cmb %>%
+  filter(n >= 10 & is.sele.7) %>%
+  filter(cell_types == "CD8T") %>%
+  group_by(sample) %>%
+  summarize(mean_CD8T_density = mean(CD8T, na.rm = TRUE), .groups = "drop")
+
+mean_density_by_sample <- mean_cd4t_density_by_sample %>%
+  full_join(mean_cd8t_density_by_sample, by = "sample") %>%
+  left_join(pd7 %>% dplyr::select(id, BRCA, BOR, bt3, TimePoint, Patient.ID), by = c("sample" = "id"))
+
+p_mean_cd4t_by_bt3 <- plot_ct(mean_density_by_sample, y_var = "mean_CD4T_density",
+                                y_label = "Mean CD4T density per sample",
+                                title = "Mean CD4T density by BRCA x TimePoint",
+                                pt.cols = pt.cols)$plot
+p_mean_cd4t_by_bt3
+
+ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "plot_ct_mean_cd4t_density_by_bt3.pdf"),
+       p_mean_cd4t_by_bt3, width = 5, height = 7)
+
+p_mean_cd8t_by_bt3 <- plot_ct(mean_density_by_sample, y_var = "mean_CD8T_density",
+                                y_label = "Mean CD8T density per sample",
+                                title = "Mean CD8T density by BRCA x TimePoint",
+                                pt.cols = pt.cols)$plot
+p_mean_cd8t_by_bt3
+
+ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "plot_ct_mean_cd8t_density_by_bt3.pdf"),
+       p_mean_cd8t_by_bt3, width = 5, height = 7)
+```
+
+### [Fig 6I, 4L, 4M, EDF10A] T-Cell Regression and Expression Mapping
+
+#### PD1 vs density, highlighting TME-11/TME-12
+```{r}
+df2 <- df %>%
+  filter(center %in% c("CD4T","CD8T"), neighbor %in% c("CD4T","CD8T")) %>%
+  mutate(
+    cluster_id = str_replace_all(cluster, "TME_", "TME-"),
+    cluster_id = factor(cluster_id, levels = paste0("TME-", 1:17)),
+    
+    cluster_plot = case_when(
+      cluster_id %in% c("TME-11","TME-12") ~ as.character(cluster_id),
+      TRUE ~ "others"
+    )
+  ) %>%
+  arrange(cluster_plot != "others")   # others first (behind), highlighted last
+
+
+ct.cols17.1 <- ct.cols17
+names(ct.cols17.1) <- sub("_","-",names(ct.cols17))
+plot_cols <- c(
+  others = "grey70",
+  unname(ct.cols17.1[c("TME-11", "TME-12")])
+)
+names(plot_cols)[2:3] <- c("TME-11", "TME-12")
+
+p_density <- ggplot(
+  df2,
+  aes(density, PD1, colour = cluster_plot)
+) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = plot_cols) +
+  facet_grid(center ~ neighbor, switch = "y") +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.x = element_text(size = 12),
+    strip.text.y.left = element_text(angle = 90, size = 12),
+    axis.text.x  = element_text(size = 16, color = "black"),
+    axis.text.y  = element_text(size = 15, color = "black"),
+    axis.title.x = element_text(size = 17, margin = margin(t = 2, r = 4), color = "black"),
+    axis.title.y = element_text(size = 17, margin = margin(r = 4), color = "black"),
+    plot.title   = element_text(size = 20, hjust = 0.5, color = "black"),
+    legend.text  = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 15, color = "black"),
+    strip.text   = element_text(size = 16, color = "black"),
+    legend.key.size = unit(1.2, "cm"),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "TME-11 and TME-12",
+    x = "Density",
+    y = "PD1",
+    colour = "CN cluster"
+  )
+
+ggsave(
+  file.path(cycif_fig_dir, "spatial", "tcell_density", "tme_clusters", "correlation_tcell_pd1_density_TME11_12.pdf"),
+  p_density,
+  width = 6.5,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+```
+
+#### Full brms model: PD1 ~ center x density, bt3 as random-slope grouping
+
+No bt3-balancing cap: `fit_full`'s random-slope term handles per-group shrinkage directly.
+`center` (3 levels) is too few for a random-slope variance component, so it's a fixed
+interaction; `bt3` (6 levels) is its own non-nested random-slope grouping.
+```{r}
+df1 <- frnn7.cmb %>%
+  mutate(bt3 = factor(paste0(BRCA, "_", TimePoint),
+                       levels = c("MUT_BS","MUT_BX2","MUT_BX3","WT_BS","WT_BX2","WT_BX3"))) %>%
+  filter(n >= 10 & is.sele.7) %>%
+  filter(cell_types %in% c("CD8T","CD4T","T_other")) %>%
+  mutate(cell_types = factor(cell_types, levels = c("CD8T","CD4T","T_other"))) %>%
+  dplyr::select(PD1, CD8T, CD4T, T_other, center = cell_types, Patient.ID, bt3)
+
+# org.Hs.eg.db masks dplyr::select(), which brms/rstan's internals rely on.
+if ("package:org.Hs.eg.db" %in% search()) detach("package:org.Hs.eg.db", unload = TRUE)
+
+fit_full <- brm(
+  PD1 ~ 0 + center + center:CD8T + center:CD4T + center:T_other +
+    (1 + CD8T + CD4T + T_other || bt3) + (1 | Patient.ID),
+  data = df1, family = student(), iter = 4000, chains = 4, cores = 4, seed = 123,
+  control = list(adapt_delta = 0.95)
+)
+```
+
+##### Convergence Check (Rhat < 1.01 threshold)
+```{r}
+summary(fit_full)$fixed
+cat("Max Rhat across all parameters:", max(brms::rhat(fit_full), na.rm = TRUE), "\n")
+```
+
+##### Divergent Transitions
+```{r}
+np_full <- brms::nuts_params(fit_full)
+n_divergent <- sum(np_full$Value[np_full$Parameter == "divergent__"])
+n_post_warmup <- sum(fit_full$fit@sim$n_save - fit_full$fit@sim$warmup2)
+cat("Divergent transitions:", n_divergent, "out of", n_post_warmup, "post-warmup iterations\n")
+```
+
+##### Posterior Predictive Check
+
+Overlays draws from the model's posterior predictive distribution on the observed PD1
+distribution.
+```{r}
+p_ppc_full <- pp_check(fit_full, ndraws = 100) +
+  labs(title = "Posterior predictive check: fit_full (PD1 ~ CD8T + CD4T + T_other)")
+ggsave(file.path(cycif_fig_dir, "misc", "qc", "brm_tcell_pd1_pp_check.pdf"), p_ppc_full, width = 7, height = 5)
+p_ppc_full
+```
+
+##### Extract Coefficients
+
+Point estimate + 95% credible interval per center, per neighbor-type slope, parsed from
+`fixef()` rows named `"center{level}:{term}"`.
+```{r}
+coef_df <- as.data.frame(fixef(fit_full)) %>%
+  rownames_to_column("param") %>%
+  filter(str_detect(param, ":")) %>%
+  mutate(
+    center   = str_remove(str_extract(param, "^center[^:]+"), "^center"),
+    neighbor = str_remove(param, "^center[^:]+:")
+  ) %>%
+  rename(slope = Estimate, ci_low = Q2.5, ci_high = Q97.5) %>%
+  mutate(
+    center   = factor(center, levels = c("CD4T", "CD8T", "T_other")),
+    neighbor = factor(neighbor, levels = c("CD4T", "CD8T", "T_other"))
+  ) %>%
+  select(center, neighbor, slope, Est.Error, ci_low, ci_high)
+
+coef_df
+```
+### [Fig 4L] brm_tcell_pd1_coef_plot_combined
+
+Pairwise p-values between the three neighbor-density coefficients, within each center only.
+Uses posterior draws directly: for each pair, a two-sided Bayesian p-value analog (2x the
+smaller tail probability of the draw-level difference being on one side of zero). One
+`facet_wrap(~center)` plot with a single global `y_base`, so brackets align across panels.
+```{r}
+draws_full <- as_draws_df(fit_full)
+
+comparisons <- list(c("CD4T", "CD8T"), c("CD4T", "T_other"), c("CD8T", "T_other"))
+
+coef_pval_df <- purrr::map_dfr(levels(coef_df$center), function(ctr) {
+  map_dfr(comparisons, function(comp) {
+    col1 <- paste0("b_center", ctr, ":", comp[1])
+    col2 <- paste0("b_center", ctr, ":", comp[2])
+    diff <- draws_full[[col1]] - draws_full[[col2]]
+    pval <- 2 * min(mean(diff > 0), mean(diff < 0))
+    tibble(center = ctr, term1 = comp[1], term2 = comp[2], pval = pval)
+  })
+}) %>%
+  mutate(center = factor(center, levels = levels(coef_df$center)),
+         label = signif(pval, 2))
+
+term_levels <- levels(coef_df$neighbor)
+x_pos <- setNames(seq_along(term_levels), term_levels)
+y_base <- max(coef_df$ci_high, na.rm = TRUE)
+y_offsets <- c("CD4T_CD8T" = y_base * 1.15, "CD8T_T_other" = y_base * 1.15,
+               "CD4T_T_other" = y_base * 1.35)
+
+ann_df <- coef_pval_df %>%
+  mutate(
+    x1 = x_pos[term1] + 0.05,
+    x2 = x_pos[term2] - 0.05,
+    xmid = (x1 + x2) / 2,
+    contrast = paste(term1, term2, sep = "_"),
+    y = y_offsets[contrast]
+  )
+
+p_brm_combined <- ggplot(coef_df, aes(x = neighbor, y = slope, color = neighbor)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "gray50") +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high), size = 0.6, linewidth = 0.8) +
+  geom_segment(data = ann_df, aes(x = x1, xend = x2, y = y, yend = y),
+               inherit.aes = FALSE, color = "black", linewidth = 0.4) +
+  geom_text(data = ann_df, aes(x = xmid, y = y * 1.02, label = label),
+            inherit.aes = FALSE, size = 4, vjust = 0) +
+  facet_wrap(~ center, nrow = 1) +
+  coord_cartesian(ylim = c(min(coef_df$ci_low, na.rm = TRUE), y_base * 1.35 * 1.05)) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "PD1 expression ~ neighboring T-cell density",
+    # subtitle = "Point estimate + 95% CrI; brackets: pairwise posterior comparison within each center",
+    x = "Neighboring T-cell type",
+    y = "Posterior slope (fixed interaction coefficient)"
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+p_brm_combined
+
+ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "pd1_tcell_density_slope", "brm_tcell_pd1_coef_plot_combined.pdf"),
+       p_brm_combined, width = 5.5, height = 6, dpi = 300)
+```
+
+### [Fig 4M] correlation_tcell_pd1_density_ab_self (GrB)
+```{r}
+cst7.abs.log <- paste0(cst7.abs, ".log")
+
+for(ab in cst7.abs.log[1]){
+  lst.objs <- list()
+  cell_types <- c("CD8T", "CD4T", "T_other")
+
+  for (obj_name in names(datasets)) {
+    obj <- datasets[[obj_name]]
+
+    for (ct in cell_types) {
+      key <- paste0(obj_name, ".", ct)
+
+
+      x1 <- obj$PD1.log
+      y1 <- obj[[ct]]
+      z1 <- obj[[ab]]
+      cl <- obj$cluster
+      if (obj_name == ct) y1 <- y1 - 1
+
+      set.seed(12345)
+      x_scaled <- scale(x1)[, 1] + runif(length(x1), -0.5, 0.5)
+      y_scaled <- scale(y1)[, 1]
+
+      eps_x <- diff(range(x_scaled, na.rm = TRUE)) * 0.01
+      eps_y <- diff(range(y_scaled, na.rm = TRUE)) * 0.01
+
+      coords <- cbind(
+        x_scaled + runif(length(x_scaled), -eps_x, eps_x),
+        y_scaled + runif(length(y_scaled), -eps_y, eps_y)
+      )
+
+      knn <- get.knn(coords, k = 20)
+      knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+
+      z1.smooth <- apply(knn_indices, 1, function(idx) {
+        mean(z1[idx], na.rm = TRUE)
+      })
+
+      lst.objs[[key]] <- data.frame(
+        center   = obj_name,
+        neighbor = ct,
+        PD1      = x1,
+        density  = y1,
+        ab       = z1.smooth,
+        cluster  = cl
+      )
+    }
+  }
+
+  df <- do.call(rbind, lst.objs) %>%
+    filter(center %in% c("CD8T","CD4T"),neighbor %in% c("CD8T","CD4T")) %>%
+    mutate(center   = factor(center,   levels = c("CD8T", "CD4T")),
+           neighbor = factor(neighbor, levels = c("CD8T", "CD4T")))
+
+  q <- quantile(df$ab, c(0.01, 0.99), na.rm = TRUE)
+  df$ab <- pmin(pmax(df$ab, q[1]), q[2])
+
+  p_ab <- ggplot(df %>% arrange(ct), aes(density, PD1, colour = ab)) + # density_col
+    geom_point(size = 0.5) +
+    scale_color_viridis_c(
+      option = "viridis",   # blue → green → yellow
+      direction = 1,
+      name = paste0(sub("\\.log","",ab), "\n(log exp)")
+    ) +
+    facet_grid(center ~ neighbor, switch = "y") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text.x = element_text(size = 12),
+      strip.text.y.left = element_text(angle = 90, size = 12),
+      axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 16,color = "black"),
+      axis.text.y  = element_text(size = 15,color = "black"),
+      axis.title.x = element_text(size = 17, margin = margin(t=2, r = 4),color = "black"),  # tighter gap to ticks
+      axis.title.y = element_text(size = 17, margin = margin(r = 4),color = "black"),  # tighter gap to ticks
+      plot.title   = element_text(size = 20, hjust = 0.5,color = "black"),
+      legend.text  = element_text(size = 14,color = "black"),
+      legend.title = element_text(size = 15,color = "black"),
+      strip.text   = element_text(size = 16,color = "black"),
+      legend.key.size = unit(1.2, "cm")
+    ) +
+    labs(x = "Number of neighboring T cells per CN", y = "PD1 expression in center T cells", title= paste0(sub("\\.log","",ab)," expression"))
+
+
+  ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "exps_in_self", paste0("correlation_tcell_pd1_density_",sub("\\.log","",ab),"_v2.pdf")),
+         p_ab, width = 6, height = 5, units="in", dpi=300)
+}
+```
+### [Fig 6J, EDF10A] correlation_tcell_pd1_density_ab_tme (PDL1, pTBK1, gH2AX, PD1)
+```{r}
+for(ab in cst7.abs[c(3,4,9,10)]){
+  lst.objs <- list()
+  cell_types <- c("CD8T", "CD4T", "T_other")
+
+  for (obj_name in names(datasets)) {
+    obj <- datasets[[obj_name]]
+
+    for (ct in cell_types) {
+      key <- paste0(obj_name, ".", ct)
+
+
+      x1 <- obj$PD1.log
+      y1 <- obj[[ct]]
+      z1 <- obj[[ab]]
+      cl <- obj$cluster
+      if (obj_name == ct) y1 <- y1 - 1
+
+      set.seed(12345)
+      x_scaled <- scale(x1)[, 1] + runif(length(x1), -0.5, 0.5)
+      y_scaled <- scale(y1)[, 1]
+
+      eps_x <- diff(range(x_scaled, na.rm = TRUE)) * 0.01
+      eps_y <- diff(range(y_scaled, na.rm = TRUE)) * 0.01
+
+      coords <- cbind(
+        x_scaled + runif(length(x_scaled), -eps_x, eps_x),
+        y_scaled + runif(length(y_scaled), -eps_y, eps_y)
+      )
+
+      knn <- get.knn(coords, k = 20)
+      knn_indices <- cbind(1:nrow(coords), knn$nn.index)
+
+      z1.smooth <- apply(knn_indices, 1, function(idx) {
+        mean(z1[idx], na.rm = TRUE)
+      })
+
+      lst.objs[[key]] <- data.frame(
+        center   = obj_name,
+        neighbor = ct,
+        PD1      = x1,
+        density  = y1,
+        ab       = z1.smooth,
+        cluster  = cl
+      )
+    }
+  }
+
+  df <- do.call(rbind, lst.objs) %>%
+    filter(center %in% c("CD8T","CD4T"),neighbor %in% c("CD8T","CD4T")) %>%
+    mutate(center   = factor(center,   levels = c("CD8T", "CD4T")),
+           neighbor = factor(neighbor, levels = c("CD8T", "CD4T")))
+
+  q <- quantile(df$ab, c(0.025, 0.975), na.rm = TRUE)
+  df$ab <- pmin(pmax(df$ab, q[1]), q[2])
+
+  p_ab <- ggplot(df %>% arrange(ct), aes(density, PD1, colour = ab)) + # density_col
+    geom_point(size = 0.5) +
+    scale_color_viridis_c(
+      option = "viridis",   # blue → green → yellow
+      direction = 1,
+      name = paste0(ab, "\n(log exp)")
+    ) +
+    facet_grid(center ~ neighbor, switch = "y") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text.x = element_text(size = 12),
+      strip.text.y.left = element_text(angle = 90, size = 12),
+      axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 16,color = "black"),
+      axis.text.y  = element_text(size = 15,color = "black"),
+      axis.title.x = element_text(size = 17, margin = margin(t=2, r = 4),color = "black"),  # tighter gap to ticks
+      axis.title.y = element_text(size = 17, margin = margin(r = 4),color = "black"),  # tighter gap to ticks
+      plot.title   = element_text(size = 20, hjust = 0.5,color = "black"),
+      legend.text  = element_text(size = 14,color = "black"),
+      legend.title = element_text(size = 15,color = "black"),
+      strip.text   = element_text(size = 16,color = "black"),
+      legend.key.size = unit(1.2, "cm"),
+      legend.position = "none"
+    ) +
+    labs(x = "Number of neighboring T cells per CN", y = "PD1 expression in center T cells", title= paste0(ab," expression (CN)"))
+
+
+  ggsave(file.path(cycif_fig_dir, "spatial", "tcell_density", "exps_in_tme", paste0("correlation_tcell_pd1_density_",ab,"_v2.pdf")),
+         p_ab, width = 5, height = 5, units="in", dpi=300)
+}
+```
+
+## ---- TS Ratio Violin Plots ----
+
+### Predicted Tumor/Stroma Classification
+
+`is_pred_stroma` is a logistic regression predicting stroma membership from local cell-type
+composition (`frnn7.cmb`'s own `uniq.cts` columns), trained on a size- and distance-stratified
+subsample of baseline-sample cells, then applied to every cell in `frnn7.cmb`.
+```{r}
+is.ge10.7 <- rowSums(frnn7.rcn) >= 10
+
+frnn7.cmb$dist <- unlist(sapply(lst.dists7, function(ld) ld$dist$dist))
+frnn7.cmb <- frnn7.cmb %>% mutate(Tumor = Tumor_panCK + Tumor_neg)
+
+train_pool <- frnn7.cmb %>%
+  filter(is.ge10.7) %>%
+  filter(grepl("-1$", sample)) %>%
+  mutate(is_stroma = ifelse(dist > 0.5, 1, 0))
+
+min_cells <- train_pool %>%
+  count(sample) %>%
+  pull(n) %>%
+  sort() %>%
+  `[`(3)
+
+prop_within_min <- 0.9
+num_within_target  <- round(min_cells * prop_within_min)
+num_outside_target <- min_cells - num_within_target
+
+set.seed(123)
+train_set <- train_pool %>%
+  group_by(sample) %>%
+  group_modify(~ {
+    df <- .x
+    within_idx  <- which(df$dist >= -250 & df$dist <= 250)
+    outside_idx <- which(df$dist < -250 | df$dist > 250)
+
+    n_within_avail  <- length(within_idx)
+    n_outside_avail <- length(outside_idx)
+
+    n_outside_sel <- min(n_outside_avail, num_outside_target)
+    n_within_sel  <- min(n_within_avail, num_within_target)
+
+    if (n_outside_sel < num_outside_target) {
+      additional_needed <- num_outside_target - n_outside_sel
+      n_within_sel <- min(n_within_avail, n_within_sel + additional_needed)
+    }
+
+    total_selected <- n_within_sel + n_outside_sel
+    if (total_selected < min_cells) {
+      remaining <- min_cells - total_selected
+      extra_outside <- min(n_outside_avail - n_outside_sel, remaining)
+      n_outside_sel <- n_outside_sel + extra_outside
+      remaining <- min_cells - (n_within_sel + n_outside_sel)
+      if (remaining > 0) {
+        n_within_sel <- min(n_within_avail, n_within_sel + remaining)
+      }
+    }
+
+    selected_within  <- if (n_within_sel > 0)  sample(within_idx, n_within_sel)   else integer(0)
+    selected_outside <- if (n_outside_sel > 0) sample(outside_idx, n_outside_sel) else integer(0)
+
+    df$is_selected <- FALSE
+    df$is_selected[c(selected_within, selected_outside)] <- TRUE
+    df
+  }) %>%
+  ungroup() %>%
+  filter(is_selected)
+
+logit_model <- glm(
+  is_stroma ~ Tumor + Fibro + CD8T + CD4T + T_other +
+    Mac_CD68 + Mac_CD163 + Mac_CD68_CD163 + Immune_other,
+  data = train_set, family = binomial
+)
+
+frnn7.cmb$predicted_prob_stroma <- predict(logit_model, newdata = frnn7.cmb, type = "response")
+frnn7.cmb$is_pred_stroma <- as.numeric(frnn7.cmb$predicted_prob_stroma > 0.5)
+```
+
+### [EDF8A] Predicted Tumor/Stroma Classification -- Example ROIs
+
+4 example ROIs (`1013-1`, `1013-2` = BS/BX2; `3002-1`, `3002-2` = BS/BX2). Per-sample
+`wr <- this.cts %in% uniq.cts` filters `cs7[[nm]]`'s cells to the same cell-type set
+`frnn7.cmb` was itself filtered to, so `tmp.all` (rows of `frnn7.cmb` for that sample) and the
+`wr`-filtered per-cell vectors below are assumed row-order-aligned -- verify this alignment
+holds before trusting the rendered output.
+```{r}
+this.nms <- c("1013-1","1013-2","3002-1","3002-2")
+max.y <- cyApply(cs7[this.nms],function(cy)max(xys(cy)$Y_centroid))
+coords <- list(`1013-1`=list(x=8660,y=4963),
+             `1013-2`=list(x=5640,y=6724),
+             `3002-1`=list(x=13326,y=15142),
+             `3002-2`=list(x=11119,y=16249))
+locs <- lapply(seq(coords),function(i)list(x=coords[[i]]$x,y=max.y[[i]]-coords[[i]]$y))
+names(locs) <- names(coords)
+
+library(sf)
+
+make_square <- function(cx, cy, h) {
+  coords <- matrix(c(
+    cx - h, cy - h,
+    cx + h, cy - h,
+    cx + h, cy + h,
+    cx - h, cy + h,
+    cx - h, cy - h
+  ), ncol = 2, byrow = TRUE)
+  st_polygon(list(coords))
+}
+
+h <- 400  # ROI half-width
+
+for(nm in this.nms){
+  tmp.all <- frnn7.cmb %>% filter(sample == nm)
+  is.str.1 <- factor(c("Tumor","Stroma")[tmp.all$is_pred_stroma + 1], levels = c("Tumor","Stroma"))
+
+  x1 <- cs7[[nm]]
+
+  this.cts <- cell_types(x1)$cell_types
+  this.cts <- as.character(this.cts)
+  this.cts[is.na(this.cts)] <- "NA"
+
+  wr <- this.cts %in% uniq.cts
+
+  xy <- xys(x1)
+  xy$Y_centroid <- max(xy$Y_centroid) - xy$Y_centroid
+  xy.sf <- st_as_sf(xy[wr,],coords=c("X_centroid","Y_centroid"))
+
+  obj <- lst.dists7[[nm]]
+  this.cts1 <- this.cts[wr]
+  this.b <- do.call(rbind,obj$borders)
+
+  cols <- c(Tumor=2, Stroma=4)
+
+  xy1 <- locs[[nm]]
+  squares <- st_sfc(make_square(xy1$x, xy1$y, h),crs = st_crs(xy.sf))
+  sq_union <- st_union(squares)
+
+  inside <- lengths(st_intersects(xy.sf, sq_union)) > 0
+  xy_sub <- xy.sf[inside, ]
+  col_sub <- cols[is.str.1][inside]
+  cts_sub <- this.cts1[inside]
+  ct_col_sub <- ct.cols7[cts_sub]
+
+  poly_inside <- lengths(st_intersects(this.b[[1]], sq_union)) > 0
+  b_clipped <- st_intersection(this.b[[1]], sq_union)
+
+  if(!dir.exists(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "logit"))){
+    dir.create(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "logit"),recursive=TRUE)
+  }
+
+  pdf(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "logit", paste0("ts_",nm,"_roi_logit.pdf")), width=7, height=7)
+  par(mar=c(1,1,1,1))
+  plot(xy_sub, pch = 20, col = col_sub, asp = 1, cex=1, main = "", reset = FALSE)
+  plot(squares, border = "black", add = TRUE, lwd = 2)
+  plot(b_clipped, border="grey20", add=TRUE, lwd=2)
+  dev.off()
+
+  pdf(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "logit", paste0("ts_",nm,"_roi_cts.pdf")), width=7, height=7)
+  par(mar=c(1,1,1,1))
+  plot(xy_sub, pch = 20, col = ct_col_sub, asp = 1, cex=1, main = "", reset = FALSE)
+  plot(squares, border = "black", add = TRUE, lwd = 2)
+  plot(b_clipped, border="grey20", add=TRUE, lwd=2)
+  dev.off()
+}
+```
+
+### [EDF8G] Tumor/Stroma Classification on Macrophage UMAP
+
+```{r}
+frnn7.cmb.mac.ts <- frnn7.cmb %>%
+  filter(cell_types %in% c("Mac_CD68","Mac_CD163","Mac_CD68_CD163")) %>%
+  filter(is.sele.mac) %>%
+  cbind(dt.mac.1 %>% dplyr::select(umap_x,umap_y)) %>%
+  mutate(cluster = dt.mac.1 %>% pull(cluster)) %>%
+  mutate(is_stroma.1 = factor(c("Tumor","Stroma")[is_pred_stroma + 1], levels = c("Tumor","Stroma")))
+
+p_full <- umap_base(frnn7.cmb.mac.ts, aes(x = umap_x, y = umap_y, col = is_stroma.1)) +
+  umap_styling_num() +
+  scale_color_manual(values=c(Tumor=2,Stroma=4))
+p_main <- p_full + theme(legend.position="none")
+ggsave(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "umap_ts_class_mac.png"),
+   p_main, width = 7, height = 7, units = "in", dpi = 300)
+save_legend_pdf(p_full, file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "umap_ts_class_legend_mac.pdf"), width = 4, height = 6)
+```
+
+Per-macrophage-cluster Tumor/Stroma composition -- each cluster's Tumor+Stroma proportions
+sum to 1.
+```{r}
+tab <- apply(table(frnn7.cmb.mac.ts$cluster, frnn7.cmb.mac.ts$is_stroma.1), 1, function(x) x/sum(x))
+
+pdf(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "classification", "ts_ratio_enrichment_in_niche_mac_barplot.pdf"), width = 5, height = 7)
+par(mar = c(5, 5, 4, 10))
+barplot(tab[, rev(seq_len(ncol(tab)))], beside = FALSE, col = c(2, 4),
+        horiz = TRUE,
+        main = "",
+        xlab = "Tumor-Stroma proportion", ylab = "", las = 2)
+legend(par()$usr[2] + .1, par()$usr[4] - 1, rownames(tab), fill = c(2, 4), xpd = TRUE, border = TRUE)
+dev.off()
+```
+
+### [Fig 6C top] TME Cluster Composition by Tumor vs Stroma
+
+Joins `frnn7.cmb$is_pred_stroma` (computed above) and `frnn7.cmb$cluster_tme` (the TME
+cluster assignment from file 3) at the per-cell level, since both columns already live on
+the same `frnn7.cmb` table at this point in the notebook.
+```{r}
+freq.ts <- frnn7.cmb %>%
+  filter(!is.na(cluster_tme) & !is.na(is_pred_stroma)) %>%
+  mutate(is_stroma = factor(is_pred_stroma, levels = c(0,1), labels = c("Tumor","Stroma"))) %>%
+  group_by(is_stroma, cluster_tme) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  group_by(cluster_tme) %>%
+  mutate(freq = n / sum(n))
+
+p <- ggplot(freq.ts %>% mutate(cluster_tme = factor(cluster_tme, levels = rev(paste0("TME_",1:17)))),
+            aes(x = cluster_tme, y = freq, fill = is_stroma)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("Stroma" = 4, "Tumor" = 2), name = "is_stroma") +
+  theme_minimal() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  ggtitle("Cluster Frequencies by Tumor vs Stroma") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 10),
+    legend.position="top",
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())
+
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "expression_by_cluster", "umap_tme_cluster_barplot.pdf"), p, width = 3, height = 7, units = "in", dpi = 300)
+```
+
+### [EDF9E left] Tumor vs Stroma on TME UMAP
+
+`dt.tme.1` corresponds row-for-row to `frnn7.cmb[is.sele.tme, ]`.
+```{r}
+is.stroma.tme <- factor(frnn7.cmb$is_pred_stroma[is.sele.tme], levels = c(0,1), labels = c("Tumor","Stroma"))
+
+dt.tme.1 <- dt.tme.1 %>% mutate(is_stroma = is.stroma.tme)
+
+p9_full <- umap_base(dt.tme.1, aes(x = umap_x, y = umap_y, col = is_stroma), point_size = 0.8) +
+  scale_color_manual(values = c("Stroma" = 4, "Tumor" = 2), name = "is_stroma") +
+  ggtitle("Tumor vs Stroma")
+p9 <- p9_full + theme(legend.position = "none")
+ggsave(file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_tme_stroma.png"), p9, width = 7, height = 7, units = "in", dpi = 300)
+save_legend_pdf(p9_full, file.path(cycif_fig_dir, "umap", "tme", "metadata", "umap_tme_stroma_legend.pdf"), width = 4, height = 6)
+```
+
+### [EDF8B] Delaunay contact–based tumor/stroma mixing score
+
+Per-cell `X_centroid`/`Y_centroid` coordinates aren't carried on `frnn7.cmb` itself, so
+they're pulled from the per-sample `cs7[[sample_id]]` objects via `xys()`.
+
+```{r}
+library(deldir)
+
+# Fixed edge-length cutoff (X_centroid/Y_centroid, and thus edge lengths, are in pixel units).
+edge_len_max <- 20 / 0.65                     # 30.77 px (~20um); set NULL to disable
+n_perm <- 0                                   # set >0 (e.g., 1000) to run permutations
+
+sample_ids <- unique(frnn7.cmb$sample)
+
+results_list <- list()
+
+for(i in seq_along(sample_ids)){
+  sample_id <- sample_ids[i]
+  cat("Processing:", sample_id, "(", i, "of", length(sample_ids), ")\n")
+
+  # --- subset to this sample ---
+  df_this <- frnn7.cmb %>% filter(sample == sample_id)
+  this.cs <- cs7[[sample_id]]
+  this.cts <- cell_types(this.cs)
+  this.xys <- xys(this.cs)
+
+  cts.xys <- cbind(this.cts, this.xys) %>% filter(!is.na(cell_types))
+
+  df_s <- df_this %>%
+    mutate(type_bin = ifelse(is_pred_stroma == 1, "stroma", "tumor")) %>%
+    cbind(data.frame(x = cts.xys$X_centroid, y = cts.xys$Y_centroid)) %>%
+    select(x, y, type_bin)
+
+  if (nrow(df_s) < 3) {
+    results_list[[i]] <- tibble(
+      sample = sample_id,
+      n_cells = nrow(df_s),
+      n_edges = NA,
+      tumor_frac = NA,
+      mix_raw = NA,
+      exp_hetero = NA,
+      mix_norm = NA,
+      p_perm = NA
+    )
+    next
+  }
+
+  # --- Delaunay triangulation ---
+  tri <- deldir(df_s$x, df_s$y)
+  edges <- as_tibble(tri$delsgs[, c("ind1","ind2","x1","y1","x2","y2")]) %>%
+    mutate(len = sqrt((x1 - x2)^2 + (y1 - y2)^2))
+
+  if (!is.null(edge_len_max)) {
+    edges <- filter(edges, len <= edge_len_max)
+  }
+
+  if (nrow(edges) == 0) {
+    results_list[[i]] <- tibble(
+      sample = sample_id,
+      n_cells = nrow(df_s),
+      n_edges = 0,
+      tumor_frac = mean(df_s$type_bin == "tumor"),
+      mix_raw = NA,
+      exp_hetero = NA,
+      mix_norm = NA,
+      p_perm = NA
+    )
+    next
+  }
+
+  # --- classify edges ---
+  type1  <- df_s$type_bin[edges$ind1]
+  type2  <- df_s$type_bin[edges$ind2]
+  hetero <- (type1 != type2)
+
+  # --- mixing scores ---
+  mix_raw <- mean(hetero, na.rm = TRUE)
+  pT      <- mean(df_s$type_bin == "tumor", na.rm = TRUE)
+  pS      <- 1 - pT
+  exp_ht  <- 2 * pT * pS
+  mix_norm <- if (exp_ht > 0) mix_raw / exp_ht else NA_real_
+
+  # --- save results ---
+  results_list[[i]] <- tibble(
+    sample = sample_id,
+    n_cells = nrow(df_s),
+    n_edges = nrow(edges),
+    tumor_frac = pT,
+    mix_raw = mix_raw,
+    exp_hetero = exp_ht,
+    mix_norm = mix_norm
+  )
+}
+
+results <- bind_rows(results_list)
+r1 <- results %>%
+  left_join(pd7 %>% select(id,sample, BRCA, BOR, bt3, TimePoint, Patient.ID), by = c("sample"="id"))
+p <- plot_ct(r1,y_var = "mix_norm", y_label = "Delaunay mixing score (norm)",
+  title = "Delaunay mixing score (norm)",
+  pt.cols = pt.cols)$plot
+
+ggsave(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "delaunay", "delaunay_mixing_score_20um.pdf"),p,width=5,height=7)
+```
+
+### TS log-ratio data prep (per-cell-type, all timepoints)
+
+```{r}
+rts.all <- frnn7.cmb %>%
+  filter(cell_types %in% uniq.cts[-(1:2)]) %>%
+  mutate(is_stroma = is_pred_stroma) %>%
+  filter(!is.na(is_stroma)) %>%
+  group_by(sample) %>%
+  summarize(npos=sum(is_stroma == 1),
+            nneg=sum(is_stroma == 0),
+            ntot=n()) %>%
+  # Robustness floor: both the stroma count (npos) and the tumor count (nneg) must
+  # independently be >= 10, not just their sum (ntot) -- a sample with e.g. npos=19, nneg=1
+  # would pass an ntot>=10-only check but its ratio is driven by a single cell.
+  mutate(ratio_all = ifelse(npos >= 10 & nneg >= 10, npos/nneg, NA_real_)) %>%
+  dplyr::select(ratio_all) %>%
+  unlist()
+names(rts.all) <- nms7
+
+rts <- list()
+for(ct in uniq.cts[3:11]){
+  tmp <- frnn7.cmb %>%
+    filter(cell_types == ct) %>%
+    mutate(is_stroma = is_pred_stroma) %>%
+    filter(!is.na(is_stroma)) %>%
+    group_by(sample) %>%
+    summarize(npos=sum(is_stroma == 1),
+              nneg=sum(is_stroma == 0),
+              ntot=n()) %>%
+    mutate(ratio = ifelse(npos >= 10 & nneg >= 10, npos/nneg, NA_real_)) %>%
+    mutate(rts.all = rts.all[as.character(sample)]) %>%
+    mutate(rratio = ratio/rts.all) %>%
+    mutate(log_ratio = log2(rratio)) %>%
+    mutate(cell_type=ct)
+  rts[[ct]] <- tmp
+}
+
+log.rts <- do.call(rbind,rts) %>%
+  dplyr::select(sample,cell_type,log_ratio,ntot) %>%
+  # npos>=10 & nneg>=10 (enforced above, on both this cell type's split and the sample-wide
+  # rts.all baseline) is the per-side guard against a ratio driven by a handful of cells.
+  filter(!is.na(log_ratio)) %>%
+  mutate(cell_type = factor(cell_type,levels=uniq.cts[3:11])) %>%
+  left_join(pd7 %>% dplyr::select(id,Patient.ID,BRCA,PFS_days,bt3,BOR,TimePoint),by=c("sample"="id"))
+
+log.rts$log_ratio[log.rts$log_ratio==Inf] <- 6
+log.rts$log_ratio[log.rts$log_ratio==-Inf] <- -6
+```
+
+### [EDF8C] TS Ratio for Macrophages
+
+```{r}
+log.rts.mac <- log.rts %>%
+  filter(cell_type %in% uniq.cts[7:9]) %>%
+  mutate(cell_type=factor(cell_type,levels=uniq.cts[c(7,9,8)])) %>%
+  filter(!is.na(cell_type)) %>%
+  arrange(sample)
+
+log.rts.mac.1 <- log.rts.mac %>% dplyr::select(-ntot) %>% spread(key = cell_type, value = log_ratio)
+
+# 3 paired Wilcoxon signed-rank tests comparing TS log-ratio across the 3 macrophage subtypes
+# (moved from paired t-test, no normality justification for a t-test here).
+pvals <- rep(NA,3)
+pairs3 <- list(c(1,2),c(1,3),c(2,3))
+for(i in 1:3){
+  idx <- uniq.cts[c(7,9,8)][pairs3[[i]]]
+  p <- tryCatch(
+    suppressWarnings(wilcox.test(log.rts.mac.1[[idx[1]]],log.rts.mac.1[[idx[2]]],paired=T)$p.value),
+    error = function(e) NA_real_
+  )
+  pvals[i] <- signif(p,3)
+}
+
+# Bracket heights derived from the data range (points + per-sample connecting lines), not
+# fixed constants -- adjacent pair (1,2)/(2,3) share the lowest tier, the full-span (1,3)
+# pair sits one tier above so its bracket doesn't overlap the other two.
+y_range <- range(log.rts.mac$log_ratio, na.rm = TRUE)
+y_span  <- diff(y_range)
+bracket_step <- 0.08 * y_span
+bracket_y0   <- y_range[2] + 0.04 * y_span
+tier <- c(0, 1, 0)  # (1,2), (1,3), (2,3)
+
+df.pvals <- data.frame(
+  x1_full = sapply(pairs3, `[`, 1),
+  x2_full = sapply(pairs3, `[`, 2),
+  y  = bracket_y0 + tier * bracket_step,
+  pval = as.character(pvals)
+) %>%
+  mutate(
+    xmid = (x1_full + x2_full) / 2,
+    # Shorten each bracket by ~5% of its span (inset symmetrically).
+    x1 = x1_full + 0.025 * (x2_full - x1_full),
+    x2 = x2_full - 0.025 * (x2_full - x1_full)
+  )
+
+df.mid <- log.rts.mac %>%
+  group_by(cell_type) %>%
+  summarize(log_ratio=median(log_ratio,na.rm=T)) %>%
+  mutate(sample="mid") %>%
+  mutate(x=c(1,2,3))
+
+p <- ggplot(log.rts.mac,aes(cell_type,log_ratio)) +
+  geom_violin(aes(fill=cell_type)) +
+  scale_fill_manual(values=ct.cols7w) +
+  geom_point(size=.5,alpha=.8) +
+  geom_point(data=df.mid,aes(x=x,y=log_ratio),size=12,shape=95) +
+  geom_line(aes(group=sample),alpha=.5,color="grey30") +
+  geom_hline(yintercept = 0) +
+  ggtitle("log(Stroma/Tumor) ratio") +
+  geom_segment(data=df.pvals,aes(x=x1,xend=x2,y=y,yend=y),inherit.aes=FALSE) +
+  geom_text(data=df.pvals,aes(x=xmid,y=y,label=pval),vjust=-0.3,inherit.aes=FALSE)+
+  coord_cartesian(ylim = c(y_range[1], bracket_y0 + (max(tier)+1) * bracket_step)) +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position="none") +
+  xlab("") +
+  ylab("log2 (TS ratio)")
+
+out <- log.rts.mac %>% filter(cell_type == "Mac_CD68") %>% arrange(desc(log_ratio))
+
+fn <- paste0("ts_ratio_mac.pdf")
+pdf(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "ratio", fn),width=3,height=7)
+print(p)
+dev.off()
+```
+
+### [EDF8E] ts_ratio_all_v3
+
+TS log-ratio across all cell types (`uniq.cts[3:11]`, all time points), one-sample deviation
+from 0 tested per cell type (Wilcoxon signed-rank, moved from one-sample t-test, no normality
+justification for a t-test here), cell types ordered by median log-ratio.
+```{r}
+rts.p <- sapply(uniq.cts[3:11], function(uc) {
+  tryCatch(
+    suppressWarnings(wilcox.test(log.rts %>% filter(cell_type == uc) %>% pull(log_ratio), mu = 0, alternative = "two.sided")$p.value),
+    error = function(e) NA_real_
+  )
+})
+names(rts.p) <- uniq.cts[3:11]
+
+mid.log.rts <- log.rts %>%
+  group_by(cell_type) %>%
+  summarise(log_ratio = median(log_ratio, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(pval = rts.p[as.character(cell_type)])
+
+y.symbol <- max(log.rts$log_ratio, na.rm = TRUE) * 1.05
+
+asterisks <- mid.log.rts %>%
+  mutate(label = case_when(
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      TRUE ~ ""),
+    y = y.symbol)
+
+sorted.cts <- sort(tapply(log.rts$log_ratio, log.rts$cell_type, median, na.rm = TRUE)) %>% names()
+
+log.rts.all <- log.rts %>%
+  mutate(cell_type = factor(cell_type, levels = sorted.cts)) %>%
+  filter(!is.na(cell_type))
+
+mid.log.rts <- mid.log.rts %>%
+  mutate(cell_type = factor(cell_type, levels = sorted.cts))
+
+asterisks <- asterisks %>%
+  mutate(cell_type = factor(cell_type, levels = sorted.cts))
+
+p <- ggplot(log.rts.all, aes(cell_type, log_ratio)) +
+  geom_violin(aes(fill = cell_type), show.legend = FALSE) +
+  scale_fill_manual(values = ct.cols7w) +
+  geom_point(data = mid.log.rts, aes(x = cell_type, y = log_ratio), size = 12, shape = 95, color = "grey20") +
+  geom_jitter(color = 1, width = 0.3, size = .8) +
+  geom_hline(yintercept = 0) +
+  geom_text(data = asterisks, aes(x = cell_type, y = y, label = label),
+            inherit.aes = FALSE, size = 6, color = "black") +
+  ggtitle("log TS-ratio of all cell types (all time points)") +
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "top"
+  ) +
+  xlab("") +
+  ylab("log2 TS-ratio")
+
+pdf(file.path(cycif_fig_dir, "spatial", "tumor_stroma", "ratio", "ts_ratio_all_v3.pdf"), width = 6, height = 9)
+print(p)
+dev.off()
+```

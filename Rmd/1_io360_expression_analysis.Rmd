@@ -1,0 +1,1010 @@
+---
+title: "Gene level differential expression analysis on IO360: MUT vs WT (part 2 of 2)"
+---
+
+# TALAVE IO360 expression analysis
+
+## ---- Setup ----
+
+### Notebook Options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Project Bootstrap
+```{r bootstrap}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+source(file.path(root_dir, "functions", "plotting.R"))
+source(file.path(source_dir, "analysis_io360.R"))
+source(file.path(source_dir, "stats_utils.R"))
+source(file.path(source_dir, "io.R"))
+
+pt.cols <- load_pt_colors()
+
+for (d in c("gene_plot", "cg/volcano", "cg/heatmap", "cg/barplot",
+            "ddr/volcano", "ddr/heatmap", "all/heatmap", "all/volcano")) {
+  dir.create(file.path(io360_fig_dir, d), recursive = TRUE, showWarnings = FALSE)
+}
+
+pdf <- function(...){
+  Cairo::CairoPDF(...)
+}
+
+ggsave <- function(filename, plot = ggplot2::last_plot(), device = NULL, ...) {
+
+  if (is.null(device)) {
+    if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+      device <- grDevices::cairo_pdf
+    }
+  }
+
+  ggplot2::ggsave(filename = filename, plot = plot, device = device, ...)
+}
+```
+
+### Load normalized data
+
+```{r}
+load_io360_expression_data() # df.io360, sum.df.io360, all.gns (and other io360_expression_input_data.rda objects)
+```
+
+## ---- Gene-Level Modeling ----
+### Per-Gene Expression Plots
+```{r}
+for(gn in all.gns){
+  tmp <- sum.df.io360 %>%
+    select(PT,Patient.ID,TimePoint,bt3,BOR,!!sym(gn)) %>%
+    rename(expr = all_of(gn))
+  p <- plot_ct(tmp, y_var = "expr", 
+               y_label = "log2(expression)",
+    title = paste0(gn, " (IO360)"),
+    pt.cols = pt.cols)$plot
+  
+  ggsave(file.path(io360_fig_dir,"gene_plot",paste0(gsub("/","-",gn),".pdf")),p,width=5,height=7,units="in",dpi=300)
+}
+```
+### Mixed-Effects Modeling
+#### Long-Format Input Table
+```{r}
+expr_long <- sum.df.io360 %>%
+  select(-Subtype,-PFS_days) %>%
+  pivot_longer(
+    cols = -c(PT, Patient.ID, TimePoint, bt3, BOR, BRCA),
+    names_to = "gene",
+    values_to = "expr",
+    values_drop_na = TRUE
+  ) %>%
+  mutate(
+    Patient.ID = factor(Patient.ID),
+    TimePoint  = factor(TimePoint, levels = c("BS", "BX2", "BX3")),
+    bt3        = factor(bt3),
+    BOR        = factor(BOR)
+  )
+
+```
+
+Fits a per-BRCA-group model (not joint), since every contrast is within-group. Precomputed
+and saved to `io360_gene_contrast_results.rds`; delete the file to force recomputation.
+```{r}
+io360_gene_contrast_results_file <- file.path(io360_obj_dir, "io360_gene_contrast_results.rds")
+
+if (file.exists(io360_gene_contrast_results_file)) {
+  all_res <- readRDS(io360_gene_contrast_results_file)
+} else {
+  all_res <- expr_long %>%
+    group_by(gene) %>%
+    group_modify(~ {
+      df_gene <- prep_tmp(.x)
+      bind_rows(
+        fit_lmer_contrasts(df_gene, "WT"),
+        fit_lmer_contrasts(df_gene, "MUT")
+      )
+    }) %>%
+    ungroup() %>%
+    group_by(BRCA, contrast) %>%
+    mutate(FDR = p.adjust(p.value, method = "BH")) %>%
+    ungroup()
+
+  saveRDS(all_res, io360_gene_contrast_results_file)
+}
+
+volcano_BX2 <- all_res %>%
+  filter(contrast == "BX2 - BS") %>%
+  mutate(neglog10p = -log10(p.value))
+
+volcano_BX3 <- all_res %>%
+  filter(contrast == "BX3 - BS") %>%
+  mutate(neglog10p = -log10(p.value))
+```
+
+### Model Diagnostics: Normality Check (pooled across all genes, standardized)
+
+Residuals are standardized per gene/BRCA-group before pooling, to avoid a scale-mixing
+artifact that would otherwise look leptokurtic regardless of true normality.
+```{r}
+diag_genes <- unique(expr_long$gene)
+
+diag_residuals_list <- lapply(diag_genes, function(g) {
+  d <- expr_long %>% filter(gene == g) %>% prep_tmp()
+  list(
+    get_gene_lmer_residuals(d, "WT"),
+    get_gene_lmer_residuals(d, "MUT")
+  )
+}) %>% unlist(recursive = FALSE)
+
+diag_residuals_std <- lapply(diag_residuals_list, function(r) {
+  if (is.null(r) || length(r) < 2) return(NULL)
+  s <- sd(r)
+  if (!is.finite(s) || s == 0) return(NULL)
+  r / s
+}) %>% unlist(use.names = FALSE)
+
+cat("n genes:", length(diag_genes), " | n pooled standardized residuals:", length(diag_residuals_std), "\n")
+
+qqnorm(diag_residuals_std, main = "Q-Q plot of pooled residuals: IO360 (all genes, standardized per gene)")
+qqline(diag_residuals_std)
+```
+
+Shapiro-Wilk run across 20 subsamples of n=1000 rather than once on the full set, since the
+test becomes oversensitive at large n; W is the primary statistic.
+```{r}
+set.seed(1)
+n_draws <- 20
+draw_size <- 1000
+
+shapiro_summary <- run_shapiro_draws(diag_residuals_std, draw_size, n_draws)
+
+cat(sprintf(
+  "Shapiro-Wilk across %d draws of n=%d:\n  W: median=%.4f, range=[%.4f, %.4f]\n  p: median=%.2e, range=[%.2e, %.2e]\n",
+  n_draws, draw_size,
+  median(shapiro_summary$W), min(shapiro_summary$W), max(shapiro_summary$W),
+  median(shapiro_summary$p), min(shapiro_summary$p), max(shapiro_summary$p)
+))
+
+shapiro_summary
+```
+
+```{r}
+eff_mat_BX2 <- all_res %>%
+  filter(contrast == "BX2 - BS") %>%
+  select(gene, BRCA, estimate) %>%
+  pivot_wider(names_from = BRCA, values_from = estimate) %>%
+  tibble::column_to_rownames("gene") %>%
+  as.matrix()
+
+eff_mat_BX3 <- all_res %>%
+  filter(contrast == "BX3 - BS") %>%
+  select(gene, BRCA, estimate) %>%
+  pivot_wider(names_from = BRCA, values_from = estimate) %>%
+  tibble::column_to_rownames("gene") %>%
+  as.matrix()
+```
+
+#### Effect Matrices
+```{r}
+common_genes <- intersect(rownames(eff_mat_BX2), rownames(eff_mat_BX3))
+
+m2 <- eff_mat_BX2[common_genes, , drop = FALSE]
+m3 <- eff_mat_BX3[common_genes, , drop = FALSE]
+
+colnames(m2) <- paste0(colnames(m2), "-BX2")
+colnames(m3) <- paste0(colnames(m3), "-BX3")
+
+eff_mat_all <- cbind(m2, m3)
+
+eff_mat_all <- eff_mat_all[, c("MUT-BX2", "MUT-BX3", "WT-BX2", "WT-BX3")]
+```
+
+```{r}
+p2 <- all_res %>%
+  filter(contrast == "BX2 - BS") %>%
+  select(gene, BRCA, p.value) %>%
+  pivot_wider(names_from = BRCA, values_from = p.value) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+p3 <- all_res %>%
+  filter(contrast == "BX3 - BS") %>%
+  select(gene, BRCA, p.value) %>%
+  pivot_wider(names_from = BRCA, values_from = p.value) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+p2 <- p2[common_genes, , drop = FALSE]
+p3 <- p3[common_genes, , drop = FALSE]
+
+colnames(p2) <- paste0(colnames(p2), "-BX2")
+colnames(p3) <- paste0(colnames(p3), "-BX3")
+
+pval_mat_all <- cbind(p2, p3)
+pval_mat_all <- pval_mat_all[, c("MUT-BX2", "MUT-BX3", "WT-BX2", "WT-BX3")]
+```
+
+```{r}
+f2 <- all_res %>%
+  filter(contrast == "BX2 - BS") %>%
+  select(gene, BRCA, FDR) %>%
+  pivot_wider(names_from = BRCA, values_from = FDR) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+f3 <- all_res %>%
+  filter(contrast == "BX3 - BS") %>%
+  select(gene, BRCA, FDR) %>%
+  pivot_wider(names_from = BRCA, values_from = FDR) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+f2 <- f2[common_genes, , drop = FALSE]
+f3 <- f3[common_genes, , drop = FALSE]
+
+colnames(f2) <- paste0(colnames(f2), "-BX2")
+colnames(f3) <- paste0(colnames(f3), "-BX3")
+
+FDR_mat_all <- cbind(f2, f3)
+FDR_mat_all <- FDR_mat_all[, c("MUT-BX2", "MUT-BX3", "WT-BX2", "WT-BX3")]
+```
+
+## ---- Targeted Gene Programs ----
+### cGAS-STING Genes
+```{r}
+sig_df <- readRDS(file.path(io360_obj_dir, "sting_from_literature.rds"))
+
+gene_col <- names(sig_df)[str_detect(tolower(names(sig_df)), "gene")][1]
+set_col  <- names(sig_df)[str_detect(tolower(names(sig_df)), "ref")][1]
+
+stopifnot(!is.na(gene_col), !is.na(set_col))
+
+sig_df2 <- sig_df %>%
+  transmute(
+    gene = as.character(.data[[gene_col]]),
+    set  = as.character(.data[[set_col]])
+  ) %>%
+  filter(!is.na(gene), gene != "", !is.na(set), set != "") %>%
+  mutate(
+    gene = str_trim(gene),
+    set  = str_trim(set)
+  )
+
+cg_sting_genes <- sig_df2 %>%
+  pull(gene) %>% unique()
+
+cg_genes_use <- intersect(cg_sting_genes, rownames(eff_mat_all))
+
+length(cg_genes_use)  # sanity check
+
+eff_mat_cg <- eff_mat_all[cg_genes_use, , drop = FALSE]
+
+max_abs <- max(abs(eff_mat_cg), na.rm = TRUE)
+breaks_seq <- seq(-max_abs, max_abs, length.out = 101)
+```
+
+#### [Fig 3AB] cGAS-STING Volcano Plot
+
+Plotted against nominal p.
+```{r}
+volcano_BX2_cg <- volcano_BX2 %>% filter(gene %in% cg_genes_use)
+volcano_BX3_cg <- volcano_BX3 %>% filter(gene %in% cg_genes_use)
+
+p_v_BX2 <- make_volcano(volcano_BX2_cg, title = "BX2 (vs BS)", n_label = 20, metric = "p.value")
+p_v_BX3 <- make_volcano(volcano_BX3_cg, title = "BX3 (vs BS)", n_label = 20, metric = "p.value")
+
+ymax <- max(p_v_BX2$data$neglog10p, p_v_BX3$data$neglog10p, na.rm = TRUE)
+xmin <- min(p_v_BX2$data$estimate, p_v_BX3$data$estimate, na.rm = TRUE)
+xmax <- max(p_v_BX2$data$estimate, p_v_BX3$data$estimate, na.rm = TRUE)
+
+p_v_BX2 <- p_v_BX2 + coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+p_v_BX3 <- p_v_BX3 + coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+
+ggsave(file.path(io360_fig_dir, "cg", "volcano", "volcano_BX2_cg_pval.pdf"), p_v_BX2, width = 8, height = 3.8)
+ggsave(file.path(io360_fig_dir, "cg", "volcano", "volcano_BX3_cg_pval.pdf"), p_v_BX3, width = 8, height = 3.8)
+
+p_v_BX2_cg <- p_v_BX2
+p_v_BX3_cg <- p_v_BX3
+```
+
+#### [Fig 3C] cGAS-STING Heatmap
+```{r}
+genes_hm <- rownames(eff_mat_cg)
+
+memb_long <- sig_df2 %>%
+  mutate(set_lower = tolower(set)) %>%
+  filter(gene %in% genes_hm) %>%
+  transmute(
+    gene,
+    Abe    = str_detect(set_lower, "abe"),
+    Dunphy = str_detect(set_lower, "dunphy"),
+    Xia    = str_detect(set_lower, "xia")
+  ) %>%
+  group_by(gene) %>%
+  summarise(
+    Abe    = any(Abe),
+    Dunphy = any(Dunphy),
+    Xia    = any(Xia),
+    .groups = "drop"
+  )
+
+memb_wide <- tibble(gene = genes_hm) %>%
+  left_join(memb_long, by = "gene") %>%
+  mutate(across(c(Abe, Dunphy, Xia), ~ tidyr::replace_na(.x, FALSE))) %>%
+  mutate(across(c(Abe, Dunphy, Xia), ~ factor(ifelse(.x, "Yes", "No"), levels = c("No","Yes")))) %>%
+  tibble::column_to_rownames("gene")
+
+FDR_mat_cg  <- FDR_mat_all[cg_genes_use, , drop = FALSE]
+pval_mat_cg <- pval_mat_all[cg_genes_use, , drop = FALSE]
+```
+
+Two-tier significance: FDR<0.05 (black) vs nominal p<0.05 only (grey).
+```{r}
+sig_cut <- 0.05
+mat_tier_cg <- matrix("none", nrow = nrow(FDR_mat_cg), ncol = ncol(FDR_mat_cg),
+                       dimnames = dimnames(FDR_mat_cg))
+mat_tier_cg[pval_mat_cg < sig_cut] <- "nominal"
+mat_tier_cg[FDR_mat_cg < sig_cut] <- "fdr"
+mat_tier_cg[is.na(FDR_mat_cg) | is.na(pval_mat_cg)] <- "none"
+
+mat_val_filt <- eff_mat_cg
+mat_tier_filt <- mat_tier_cg
+
+cap <- 2.5
+mat_val_filt[mat_val_filt >  cap] <-  cap
+mat_val_filt[mat_val_filt < -cap] <- -cap
+
+rownames(mat_val_filt) <- gsub("\\.", "-", rownames(mat_val_filt))
+
+ann_colors <- list(
+  Abe    = c("No" = "grey80", "Yes" = "black"),
+  Dunphy = c("No" = "grey80", "Yes" = "black"),
+  Xia    = c("No" = "grey80", "Yes" = "black"),
+  BRCA   = c(MUT="#1b9e77", WT="#7570b3"),
+  Time   = c(BX2="#fc8d62", BX3="#8da0cb")
+)
+
+max_abs <- max(abs(eff_mat_cg), na.rm = TRUE)
+
+col_fun <- circlize::colorRamp2(
+  c(-cap, 0, cap),
+  c("#2166ac", "white", "#b2182b")
+)
+
+col_annot <- data.frame(
+  BRCA = c("MUT","MUT","WT","WT"),
+  Time = c("BX2","BX3","BX2","BX3"),
+  stringsAsFactors = FALSE
+)
+rownames(col_annot) <- colnames(eff_mat_cg)
+
+ha_top <- HeatmapAnnotation(
+  df  = col_annot[, c("BRCA","Time"), drop = FALSE],
+  col = ann_colors[c("BRCA","Time")],
+  which = "column",
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(3.0, "mm")
+)
+
+row_annot <- memb_wide[, c("Abe","Dunphy","Xia"), drop = FALSE]
+row_annot <- row_annot[rownames(eff_mat_cg), , drop = FALSE]
+
+ha_left <- rowAnnotation(
+  df  = row_annot,
+  col = ann_colors[c("Abe","Dunphy","Xia")],
+  annotation_name_side = "bottom",
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(3.0, "mm")
+)
+
+ht <- Heatmap(
+  mat_val_filt,
+  name = "Effect",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = ha_top,
+  left_annotation = ha_left,
+  rect_gp = gpar(col = NA),
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    tier <- mat_tier_filt[i, j]
+    ## Grey drawn first, black on top for the FDR tier.
+    if (tier %in% c("nominal", "fdr")) {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "grey30", lwd = 1.5))
+    }
+    if (tier == "fdr") {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "black", lwd = 2))
+    }
+  }
+)
+
+lgd_sig_cg <- Legend(
+  labels = c("FDR < 0.05", "nominal p < 0.05"),
+  title = "Significance",
+  type = "lines",
+  legend_gp = gpar(col = c("black", "grey30"), lwd = c(2, 1.5))
+)
+
+pdf(file.path(io360_fig_dir, "cg", "heatmap", "heatmap_cg_sting.pdf"), width = 5, height = 7)
+ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right", annotation_legend_list = list(lgd_sig_cg))
+dev.off()
+```
+
+### DDR Genes
+```{r}
+ddr_genes_use <- unique(unlist(gene.sigs[40:47]))
+mmej_genes <- c("FEN1","POLQ","PARP1")
+
+eff_mat_ddr <- eff_mat_all[ddr_genes_use, , drop = FALSE]
+
+max_abs <- max(abs(eff_mat_ddr), na.rm = TRUE)
+breaks_seq <- seq(-max_abs, max_abs, length.out = 101)
+```
+
+#### [EDF3AB] DDR Volcano Plot
+
+Plotted against nominal p.
+```{r}
+volcano_BX2_ddr <- volcano_BX2 %>% filter(gene %in% ddr_genes_use)
+volcano_BX3_ddr <- volcano_BX3 %>% filter(gene %in% ddr_genes_use)
+
+highlight_genes <- c("PARP1", "FEN1", "POLQ")
+
+p_v_BX2 <- make_volcano(
+  volcano_BX2_ddr,
+  title = "BX2 (vs BS)",
+  highlight_genes = highlight_genes,
+  n_label = 20,
+  metric = "p.value"
+)
+
+p_v_BX3 <- make_volcano(
+  volcano_BX3_ddr,
+  title = "BX3 (vs BS)",
+  highlight_genes = highlight_genes,
+  n_label = 20,
+  metric = "p.value"
+)
+
+ymax <- max(p_v_BX2$data$neglog10p, p_v_BX3$data$neglog10p, na.rm = TRUE)
+xmin <- min(p_v_BX2$data$estimate, p_v_BX3$data$estimate, na.rm = TRUE)
+xmax <- max(p_v_BX2$data$estimate, p_v_BX3$data$estimate, na.rm = TRUE)
+
+p_v_BX2 <- p_v_BX2 + coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+p_v_BX3 <- p_v_BX3 + coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+
+ggsave(file.path(io360_fig_dir, "ddr", "volcano", "volcano_BX2_ddr_pval.pdf"), p_v_BX2, width = 8, height = 3.8)
+ggsave(file.path(io360_fig_dir, "ddr", "volcano", "volcano_BX3_ddr_pval.pdf"), p_v_BX3, width = 8, height = 3.8)
+
+p_v_BX2_ddr <- p_v_BX2
+p_v_BX3_ddr <- p_v_BX3
+```
+
+#### [EDF3C] DDR Heatmap
+```{r}
+FDR_mat_ddr  <- FDR_mat_all[ddr_genes_use, , drop = FALSE]
+pval_mat_ddr <- pval_mat_all[ddr_genes_use, , drop = FALSE]
+```
+
+Two-tier significance: FDR<0.05 (black) vs nominal p<0.05 only (grey).
+```{r}
+sig_cut <- 0.05
+mat_tier_ddr <- matrix("none", nrow = nrow(FDR_mat_ddr), ncol = ncol(FDR_mat_ddr),
+                        dimnames = dimnames(FDR_mat_ddr))
+mat_tier_ddr[pval_mat_ddr < sig_cut] <- "nominal"
+mat_tier_ddr[FDR_mat_ddr < sig_cut] <- "fdr"
+mat_tier_ddr[is.na(FDR_mat_ddr) | is.na(pval_mat_ddr)] <- "none"
+
+mat_val_filt <- eff_mat_ddr
+mat_tier_filt <- mat_tier_ddr
+
+cap <- max_abs <- max(abs(eff_mat_ddr), na.rm = TRUE)
+
+mat_val_filt[mat_val_filt >  cap] <-  cap
+mat_val_filt[mat_val_filt < -cap] <- -cap
+
+col_fun <- circlize::colorRamp2(
+  c(-cap, 0, cap),
+  c("#2166ac", "white", "#b2182b")  # blue-white-red (can swap)
+)
+
+rownames(mat_val_filt) <- gsub("\\.", "-", rownames(mat_val_filt))
+
+ann_colors <- list(
+  MMEJ    = c("Other" = "grey80", "MMEJ" = "black"),
+  BRCA   = c(MUT="#1b9e77", WT="#7570b3"),
+  Time   = c(BX2="#fc8d62", BX3="#8da0cb")
+)
+
+col_annot <- data.frame(
+  BRCA = c("MUT","MUT","WT","WT"),
+  Time = c("BX2","BX3","BX2","BX3"),
+  stringsAsFactors = FALSE
+)
+rownames(col_annot) <- colnames(eff_mat_ddr)
+
+ha_top <- HeatmapAnnotation(
+  df  = col_annot[, c("BRCA","Time"), drop = FALSE],
+  col = ann_colors[c("BRCA","Time")],
+  which = "column",
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(3.0, "mm")
+)
+
+mmej_genes <- c("PARP1","FEN1","POLQ")
+
+row_annot <- data.frame(
+  MMEJ = ifelse(rownames(eff_mat_ddr) %in% mmej_genes, "MMEJ", "Other")
+)
+rownames(row_annot) <- rownames(eff_mat_ddr)
+
+ha_left <- rowAnnotation(
+  df  = row_annot,
+  col = ann_colors["MMEJ"],
+  annotation_name_side = "bottom",
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(3.0, "mm")
+)
+
+ht <- Heatmap(
+  mat_val_filt,
+  name = "Effect",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = ha_top,
+  left_annotation = ha_left,
+  rect_gp = gpar(col = NA),
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    tier <- mat_tier_filt[i, j]
+    ## Grey drawn first, black on top for the FDR tier.
+    if (tier %in% c("nominal", "fdr")) {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "grey30", lwd = 1.5))
+    }
+    if (tier == "fdr") {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "black", lwd = 2))
+    }
+  }
+)
+
+lgd_sig_ddr <- Legend(
+  labels = c("FDR < 0.05", "nominal p < 0.05"),
+  title = "Significance",
+  type = "lines",
+  legend_gp = gpar(col = c("black", "grey30"), lwd = c(2, 1.5))
+)
+
+pdf(file.path(io360_fig_dir, "ddr", "heatmap", "heatmap_ddr.pdf"), width = 5, height = 7)
+ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right", annotation_legend_list = list(lgd_sig_ddr))
+dev.off()
+```
+
+## ---- Pathway Enrichment ----
+### MSigDB Pathway Preparation
+```{r}
+gns_all <- union(volcano_BX2$gene, volcano_BX3$gene) %>% unique()
+
+msigdb <- readRDS(file.path(io360_obj_dir,"msigdb_v7.5.1_almac.rds"))
+
+gene_mapping <- AnnotationDbi::select(org.Hs.eg.db, 
+                                      keys = unique(unlist(msigdb)), 
+                                      keytype = "ENTREZID", 
+                                      columns = "SYMBOL")
+
+msigdb_symbols <- lapply(msigdb, function(gene_ids) {
+  gene_symbols <- gene_mapping$SYMBOL[match(gene_ids, gene_mapping$ENTREZID)]
+  gene_symbols <- gene_symbols[!is.na(gene_symbols)]
+  return(unique(gene_symbols))
+})
+
+db.types <- sub("_.+","",names(msigdb_symbols))
+msigdb_symbols <- msigdb_symbols[db.types %in% c("HALLMARK","ALMAC","GOBP","GOCC","GOMF","KEGG","REACTOME")]
+
+cg_sig_lists <- with(
+  sig_df,
+  tapply(gene, ref, function(x) unique(x[x %in% gns_all]))
+)
+cg_sig_lists <- c(cg_sig_lists,all=list(unique(unlist(cg_sig_lists))))
+
+msigdb_symbols <- c(msigdb_symbols, gene.sigs, CUSTOM_CGAS_STING = cg_sig_lists)
+msigdb_symbols <- lapply(msigdb_symbols, function(x) unique(x[x %in% gns_all]))
+msigdb_symbols <- msigdb_symbols[sapply(msigdb_symbols, length) >= 5 & sapply(msigdb_symbols, length) <= 500]
+
+msigdb_symbols_all <- msigdb_symbols
+msigdb_symbols <- msigdb_symbols_all[sub("_.+","",names(msigdb_symbols_all)) %in%  c("NANOSTRING","HALLMARK","CUSTOM")]
+```
+
+### FGSEA Runs
+#### BX2
+```{r}
+rank_MUT_BX2 <- make_rank_signed_logp(volcano_BX2, brca = "MUT", use = "p.value")
+rank_WT_BX2  <- make_rank_signed_logp(volcano_BX2, brca = "WT",  use = "p.value")
+
+fgsea_MUT_BX2 <- run_fgsea_rank(rank_MUT_BX2, msigdb_symbols) %>%
+  mutate(Time = "BX2", BRCA = "MUT")
+
+fgsea_WT_BX2 <- run_fgsea_rank(rank_WT_BX2, msigdb_symbols) %>%
+  mutate(Time = "BX2", BRCA = "WT")
+```
+#### BX3
+```{r}
+rank_MUT_BX3 <- make_rank_signed_logp(volcano_BX3, brca = "MUT", use = "p.value")
+rank_WT_BX3  <- make_rank_signed_logp(volcano_BX3, brca = "WT",  use = "p.value")
+
+fgsea_MUT_BX3 <- run_fgsea_rank(rank_MUT_BX3, msigdb_symbols) %>%
+  mutate(Time = "BX3", BRCA = "MUT")
+
+fgsea_WT_BX3 <- run_fgsea_rank(rank_WT_BX3, msigdb_symbols) %>%
+  mutate(Time = "BX3", BRCA = "WT")
+```
+### Top Enriched Pathways
+```{r}
+fgsea_BX2_combined <- combine_fgsea(fgsea_MUT_BX2, fgsea_WT_BX2, padj_cut = 0.05) %>%
+  mutate(Time = "BX2")
+
+fgsea_BX3_combined <- combine_fgsea(fgsea_MUT_BX3, fgsea_WT_BX3, padj_cut = 0.05) %>%
+  mutate(Time = "BX3")
+
+fgsea_all <- bind_rows(
+  fgsea_BX2_combined %>% mutate(Time = "BX2"),
+  fgsea_BX3_combined %>% mutate(Time = "BX3")
+)
+
+fgsea_long <- fgsea_all %>%
+  select(Time, pathway,
+         mut_NES, mut_pval, mut_padj,
+         wt_NES,  wt_pval, wt_padj) %>%
+  pivot_longer(
+    cols = c(mut_NES, mut_pval, wt_NES, wt_pval, mut_padj, wt_padj),
+    names_to = c("Group", ".value"),
+    names_pattern = "(mut|wt)_(NES|pval|padj)"
+  ) %>%
+  mutate(
+    Group = recode(Group, mut = "MUT", wt = "WT"),
+    Direction = case_when(
+      NES > 0 ~ "up",
+      NES < 0 ~ "down",
+      TRUE ~ "zero"
+    ),
+    Sig = pval < 0.05 & padj < 0.2
+  )
+
+pathway_df <- fgsea_long %>%
+  filter(pval < 0.05,padj < 0.2, Direction %in% c("up","down")) %>%
+  mutate(Class = paste(Group, Time, sep = "_")) %>%
+  select(Class, Direction, pathway, NES, pval,padj)
+```
+### [EDF3D] cGAS-STING Custom Pathway Enrichment Barplot
+```{r}
+cg_paths <- unique(grep("CUSTOM_CGAS_STING", pathway_df$pathway, value = TRUE))
+
+cg_fgsea <- fgsea_long %>%
+  filter(pathway %in% cg_paths) %>%
+  mutate(
+    signed_logp = sign(NES) * -log10(padj),
+    condition = paste(Group, Time, sep = "_")
+  )
+
+cg_fgsea$pathway <- cg_fgsea$pathway |>
+  gsub("CUSTOM_CGAS_STING\\.", "", x = _) |>
+  gsub(" et al", "", x = _)
+
+cg_fgsea <- cg_fgsea %>%
+  mutate(pathway = factor(pathway, levels = sort(unique(pathway))[c(2,1,3,4)]))
+  
+
+p <- ggplot(cg_fgsea,
+            aes(x = pathway,
+                y = signed_logp,
+                fill = condition)) +
+  geom_col(position = position_dodge(width = .8)) +
+  geom_hline(yintercept = 0, colour = "black") +
+  geom_hline(yintercept = c(-log10(0.05), log10(0.05)), linetype = "dashed", color = "grey50") +
+  theme_bw() +
+  labs(
+    title = "cGAS–STING pathway activity across reference signatures",
+    x = NULL,                     # remove x-axis title
+    y = "signed -log10(FDR)",
+    fill = "Condition"
+  ) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.text.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+ggsave(file.path(io360_fig_dir, "cg", "barplot", "barplot_cgas_sting.pdf"), p, width = 8, height = 4)
+```
+
+### [Fig 4A] Pathway Heatmap
+```{r}
+fgsea_long_all <- bind_rows(
+  fgsea_MUT_BX2 %>% mutate(Group="MUT", Time="BX2"),
+  fgsea_MUT_BX3 %>% mutate(Group="MUT", Time="BX3"),
+  fgsea_WT_BX2  %>% mutate(Group="WT",  Time="BX2"),
+  fgsea_WT_BX3  %>% mutate(Group="WT",  Time="BX3")
+) %>%
+  mutate(
+    Class = paste(Group, Time, sep = "_"),
+    signed_slp = sign(NES) * -log10(pval)
+  ) %>%
+  select(pathway, Class, NES, pval, padj, signed_slp)
+
+mat_val <- fgsea_long_all %>%
+  select(pathway, Class, signed_slp) %>%
+  pivot_wider(names_from = Class, values_from = signed_slp) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+```
+
+Two-tier significance: FDR<0.05 (black) vs nominal p<0.05 only (grey).
+```{r}
+sig_cut <- 0.05
+mat_tier <- fgsea_long_all %>%
+  mutate(tier = case_when(
+    padj < sig_cut ~ "fdr",
+    pval < sig_cut ~ "nominal",
+    TRUE ~ "none"
+  )) %>%
+  select(pathway, Class, tier) %>%
+  pivot_wider(names_from = Class, values_from = tier) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+
+col_order <- c("MUT_BX2","MUT_BX3","WT_BX2","WT_BX3")
+mat_val <- mat_val[, col_order, drop = FALSE]
+mat_tier <- mat_tier[, col_order, drop = FALSE]
+
+mat_val[is.na(mat_val)] <- 0
+mat_tier[is.na(mat_tier)] <- "none"
+
+keep_rows <- rowSums(mat_tier != "none") > 0
+
+mat_val_filt <- mat_val[keep_rows, , drop = FALSE]
+mat_tier_filt <- mat_tier[keep_rows, , drop = FALSE]
+
+cap <- 3.5
+mat_val_filt[mat_val_filt >  cap] <-  cap
+mat_val_filt[mat_val_filt < -cap] <- -cap
+
+rownames(mat_val_filt) <- format_pathway_label_ascii(rownames(mat_val_filt))
+
+ann_colors <- list(
+  BRCA   = c(MUT="#1b9e77", WT="#7570b3"),
+  Time   = c(BX2="#fc8d62", BX3="#8da0cb")
+)
+
+col_annot <- data.frame(
+  BRCA = c("MUT","MUT","WT","WT"),
+  Time = c("BX2","BX3","BX2","BX3"),
+  stringsAsFactors = FALSE
+)
+rownames(col_annot) <- colnames(eff_mat_ddr)
+
+ha_top <- HeatmapAnnotation(
+  df  = col_annot[, c("BRCA","Time"), drop = FALSE],
+  col = ann_colors[c("BRCA","Time")],
+  which = "column",
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(3.0, "mm")
+)
+
+row_annot <- data.frame(
+  MMEJ = ifelse(rownames(eff_mat_ddr) %in% mmej_genes, "MMEJ", "Other")
+)
+rownames(row_annot) <- rownames(eff_mat_ddr)
+
+col_fun <- circlize::colorRamp2(
+  c(-cap, 0, cap),
+  c("#2166ac", "white", "#b2182b")
+)
+
+ht <- Heatmap(
+  mat_val_filt,
+  name = "signed\n-log10(FDR)",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  rect_gp = gpar(col = NA),
+  top_annotation = ha_top,
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    tier <- mat_tier_filt[i, j]
+    ## Grey drawn first, black on top for the FDR tier.
+    if (tier %in% c("nominal", "fdr")) {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "grey30", lwd = 1.5))
+    }
+    if (tier == "fdr") {
+      grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = NA, col = "black", lwd = 2))
+    }
+  }
+)
+
+lgd_sig <- Legend(
+  labels = c("FDR < 0.05", "nominal p < 0.05"),
+  title = "Significance",
+  type = "lines",
+  legend_gp = gpar(col = c("black", "grey30"), lwd = c(2, 1.5))
+)
+
+pdf(file.path(io360_fig_dir, "all", "heatmap", "heatmap_pathways_signedslp_sigborder_v2.pdf"), width = 6, height = 8)
+ComplexHeatmap::draw(ht, annotation_legend_list = list(lgd_sig))
+dev.off()
+```
+
+## ---- Focused Pathway Follow-Up ----
+```{r}
+lym_genes  <- unique(msigdb_symbols$NANOSTRING_Lymphoid)
+allo_genes <- unique(msigdb_symbols$HALLMARK_ALLOGRAFT_REJECTION)
+
+mutup_genes_use <- unique(c(lym_genes, allo_genes))
+
+eff_mat_mutup <- eff_mat_all[mutup_genes_use, , drop = FALSE]
+
+max_abs <- max(abs(eff_mat_mutup), na.rm = TRUE)
+breaks_seq <- seq(-max_abs, max_abs, length.out = 101)
+```
+
+### [Fig 4BC] MUT-Upregulated Pathway Volcano Plot
+```{r}
+volcano_BX2_mutup <- volcano_BX2 %>%
+  filter(gene %in% mutup_genes_use)
+
+volcano_BX3_mutup <- volcano_BX3 %>%
+  filter(gene %in% mutup_genes_use)
+
+## Same gene set as before (union of Lymphoid + Allograft Rejection), but point color now
+## uses make_volcano()'s three-tier FDR/nominal/ns scheme (as in Fig.3A-B) instead of gene-set
+## membership -- axis stays nominal -log10(p) (metric = "p.value"), color reflects FDR.
+p_v_BX2_mutup <- make_volcano(
+  volcano_BX2_mutup,
+  title = "Lymphoid/Allograft: BX2 (vs BS)",
+  n_label = 20,
+  metric = "p.value"
+)
+
+p_v_BX3_mutup <- make_volcano(
+  volcano_BX3_mutup,
+  title = "Lymphoid/Allograft: BX3 (vs BS)",
+  n_label = 20,
+  metric = "p.value"
+)
+ymax <- max(
+  p_v_BX2_mutup$data$neglog10p,
+  p_v_BX3_mutup$data$neglog10p,
+  na.rm = TRUE
+)
+
+xmin <- min(
+  p_v_BX2_mutup$data$estimate,
+  p_v_BX3_mutup$data$estimate,
+  na.rm = TRUE
+)
+
+xmax <- max(
+  p_v_BX2_mutup$data$estimate,
+  p_v_BX3_mutup$data$estimate,
+  na.rm = TRUE
+)
+
+p_v_BX2_mutup <- p_v_BX2_mutup +  coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+p_v_BX3_mutup <- p_v_BX3_mutup +  coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax))
+
+
+ggsave(file.path(io360_fig_dir, "all", "volcano", "volcano_BX2_mutup_fdr.pdf"), p_v_BX2_mutup, width = 7, height = 3.8)
+ggsave(file.path(io360_fig_dir, "all", "volcano", "volcano_BX3_mutup_fdr.pdf"), p_v_BX3_mutup, width = 7, height = 3.8)
+```
+
+#### Overlap Between cGAS-STING and Other Genes
+```{r}
+universe <- unique(unlist(msigdb_symbols))
+
+pathway <- "HALLMARK_ALLOGRAFT_REJECTION"
+cgas <- unique(msigdb_symbols[[pathway]])
+
+gene_sets_to_test <- msigdb_symbols[names(msigdb_symbols) != pathway]
+
+fisher_results <- map_dfr(
+  names(gene_sets_to_test),
+  function(gs_name) {
+    
+    gs <- unique(gene_sets_to_test[[gs_name]])
+    
+    a <- length(intersect(cgas, gs))
+    b <- length(cgas) - a
+    c <- length(gs) - a
+    d <- length(universe) - (a + b + c)
+    
+    mat <- matrix(c(a, b, c, d), nrow = 2)
+    
+    ft <- fisher.test(mat)
+    
+    tibble(
+      pathway = gs_name,
+      overlap = a,
+      odds_ratio = ft$estimate,
+      pval = ft$p.value
+    )
+  }
+)
+
+fisher_results <- fisher_results %>%
+  mutate(padj = p.adjust(pval, method = "BH")) %>%
+  filter(overlap >= 3) %>%
+  arrange(pval)
+```
+
+### [Fig 3D] cGAS-STING and IFNa Barplot
+```{r}
+path_sting <- "CUSTOM_CGAS_STING"
+path_ifna  <- "HALLMARK_INTERFERON_ALPHA_RESPONSE"
+path_allo <- "HALLMARK_ALLOGRAFT_REJECTION"
+
+use_adj <- TRUE
+
+df_sig <- bind_rows(
+  extract_signed_logp(fgsea_MUT_BX2, path_sting, "MUT_BX2", use_adj),
+  extract_signed_logp(fgsea_MUT_BX3, path_sting, "MUT_BX3", use_adj),
+  extract_signed_logp(fgsea_WT_BX2,  path_sting, "WT_BX2",  use_adj),
+  extract_signed_logp(fgsea_WT_BX3,  path_sting, "WT_BX3",  use_adj),
+
+  extract_signed_logp(fgsea_MUT_BX2, path_ifna,  "MUT_BX2", use_adj),
+  extract_signed_logp(fgsea_MUT_BX3, path_ifna,  "MUT_BX3", use_adj),
+  extract_signed_logp(fgsea_WT_BX2,  path_ifna,  "WT_BX2",  use_adj),
+  extract_signed_logp(fgsea_WT_BX3,  path_ifna,  "WT_BX3",  use_adj),
+  
+  extract_signed_logp(fgsea_MUT_BX2, path_allo,  "MUT_BX2", use_adj),
+  extract_signed_logp(fgsea_MUT_BX3, path_allo,  "MUT_BX3", use_adj),
+  extract_signed_logp(fgsea_WT_BX2,  path_allo,  "WT_BX2",  use_adj),
+  extract_signed_logp(fgsea_WT_BX3,  path_allo,  "WT_BX3",  use_adj)
+  
+) %>%
+  mutate(
+    Signature = case_when(
+      pathway == path_sting ~ "cGAS–STING signature",
+      pathway == path_ifna  ~ "IFNα response (Hallmark)",
+      pathway == path_allo  ~ "Allograft rejection (Hallmark)",
+      TRUE ~ pathway
+    ),
+    Condition = factor(Condition, levels = c("MUT_BX2","MUT_BX3","WT_BX2","WT_BX3"))
+  )
+
+df_sig
+```
+
+```{r}
+p_thresh <- -log10(0.05)
+
+p_sig <- ggplot(df_sig, aes(x = Condition, y = signed_logp)) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_hline(yintercept = c(p_thresh, -p_thresh),
+             linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_col(width = 0.85) +
+  facet_wrap(~ Signature, ncol = 2) +
+  scale_x_discrete(expand = expansion(mult = c(0.3, 0.3))) +
+  labs(
+    x = NULL,
+    y = "Signed -log10(FDR)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 15),
+    axis.title.y = element_text(size = 12),
+    panel.spacing = unit(0.5, "lines")
+  )
+
+ggsave(file.path(io360_fig_dir, "cg", "barplot", "barplot_cg_sting_ifna.pdf"), p_sig, width = 4, height = 4)
+```

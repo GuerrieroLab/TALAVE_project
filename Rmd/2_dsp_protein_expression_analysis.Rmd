@@ -1,0 +1,156 @@
+---
+title: 'DSP Protein expression analysis (part 2 of 2)'
+author: "Kenichi Shimada"
+---
+
+# TALAVE DSP Protein expression analysis
+
+## ---- Setup ----
+
+### Notebook Options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Bootstrap
+
+```{r bootstrap,message=F,warning=F}
+source(file.path(root_dir, "functions", "bootstrap.R"))
+initialize_project()
+
+source(file.path(root_dir, "functions", "plotting.R"))
+source(file.path(source_dir, "analysis_dsp_protein.R"))
+source(file.path(source_dir, "stats_utils.R"))
+source(file.path(source_dir, "io.R"))
+
+pt.cols <- load_pt_colors()
+```
+
+### Load normalized data
+
+```{r}
+load(file.path(protein_obj_dir, "dsp_protein_expression_input_data.rda")) # df.dsp.all, all.prots
+```
+
+## ---- Protein-Level Modeling ----
+
+### [EDF2E (Ki67), Fig 3E (STING), EDF5B (immune)] Individual Protein Profiles
+```{r}
+dir.create(file.path(protein_fig_dir,"gene_plot"), showWarnings = FALSE)
+
+prot.stats <- list()
+
+for(pr in all.prots){
+  prot <- plot_ct_prot(df.dsp.all, y_var=pr, y_label=paste0("Log2(expression)"), title=paste0(gsub("\\.","-",pr), " (Protein)"), pt.cols=pt.cols, ymin=NULL)
+  prot.stats[[pr]] <- prot$stat
+  ggsave(file.path(protein_fig_dir,"gene_plot",paste0(gsub("[^A-Za-z0-9]","-",pr),".pdf")), prot$plot, width=9, height=7, units="in", dpi=300)
+}
+```
+
+
+### Contrast Summary Table
+```{r}
+prot_long <- build_dsp_protein_contrast_table(prot.stats)
+```
+
+## ---- Model Diagnostics ----
+
+### Normality Check: Pooled, Standardized Residuals (Multi-Draw Shapiro-Wilk)
+
+Residuals standardized per protein before pooling; Shapiro-Wilk run at two subsample sizes
+since it becomes oversensitive at large n. W is the primary statistic.
+```{r}
+resid_list <- lapply(all.prots, function(pr) {
+  r <- get_protein_lmer_residuals(df.dsp.all, pr)
+  if (is.null(r) || length(r) < 2) return(NULL)
+  r / sd(r)
+})
+resid_list <- resid_list[!sapply(resid_list, is.null)]
+pooled_resid_prot <- unlist(resid_list)
+
+cat("n proteins:", length(resid_list), " | n pooled standardized residuals:", length(pooled_resid_prot), "\n")
+
+qqnorm(pooled_resid_prot, main = "Q-Q plot of pooled residuals: DSP Protein (all proteins, standardized per protein)")
+qqline(pooled_resid_prot)
+
+set.seed(1)
+draws_1000 <- run_shapiro_draws(pooled_resid_prot, 1000)
+draws_2000 <- run_shapiro_draws(pooled_resid_prot, 2000)
+
+summary_tbl <- tibble(
+  draw_size = c(1000, 2000),
+  W_median = c(median(draws_1000$W), median(draws_2000$W)),
+  W_range = c(
+    paste0(round(range(draws_1000$W), 4), collapse = "-"),
+    paste0(round(range(draws_2000$W), 4), collapse = "-")
+  ),
+  p_median = c(median(draws_1000$p), median(draws_2000$p)),
+  p_range = c(
+    paste0(signif(range(draws_1000$p), 3), collapse = "-"),
+    paste0(signif(range(draws_2000$p), 3), collapse = "-")
+  )
+)
+summary_tbl
+```
+
+## ---- Contrast Heatmap ----
+
+### [EDF5A] Protein Contrast Heatmap
+
+Transposed to lay the heatmap out horizontally: proteins (many) run along columns, contrasts
+(few) run along rows, so the dendrogram (protein clustering) moves to the column side and the
+BRCA/Segment/Time annotation moves to the row side.
+```{r}
+heatmap_data <- prepare_dsp_protein_heatmap_data(prot_long)
+
+heat_mat <- t(heatmap_data$heat_mat)
+tier_mat <- t(heatmap_data$tier_mat)
+col_hc <- heatmap_data$row_hc
+cap <- heatmap_data$cap
+col_meta <- heatmap_data$col_meta
+ann_colors <- heatmap_data$ann_colors
+
+col_fun <- colorRamp2(c(-cap, 0, cap), c("#2166AC", "white", "#B2182B"))
+
+ha_left <- HeatmapAnnotation(
+  df = col_meta[, c("BRCA","Segment","Time")],
+  col = ann_colors,
+  which = "row",
+  annotation_name_side = "top",
+  annotation_name_gp = grid::gpar(fontsize = 10),
+  simple_anno_size = grid::unit(3.0, "mm")
+)
+
+ht <- Heatmap(
+  heat_mat,
+  name = "Signed logP (vs BS)",
+  col = col_fun,
+  left_annotation = ha_left,
+  cluster_rows = FALSE,
+  cluster_columns = col_hc,
+  show_column_dend = TRUE,
+  column_dend_height = grid::unit(18, "mm"),
+  row_names_side = "left",
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    tier <- tier_mat[i, j]
+    ## Grey drawn first, black on top for the FDR tier.
+    if (tier %in% c("nominal", "fdr")) {
+      grid::grid.rect(x, y, w, h, gp = grid::gpar(col = "grey30", fill = NA, lwd = 1.5))
+    }
+    if (tier == "fdr") {
+      grid::grid.rect(x, y, w, h, gp = grid::gpar(col = "black", fill = NA, lwd = 2))
+    }
+  }
+)
+
+lgd_sig_prot <- Legend(
+  labels = c("FDR < 0.05", "nominal p < 0.05"),
+  title = "Significance",
+  type = "lines",
+  legend_gp = grid::gpar(col = c("black", "grey30"), lwd = c(2, 1.5))
+)
+
+pdf(file.path(protein_fig_dir,"heatmap","prot_heatmap_v2_2.pdf"),width=14,height=6)
+ComplexHeatmap::draw(ht, annotation_legend_list = list(lgd_sig_prot))
+dev.off()
+```
